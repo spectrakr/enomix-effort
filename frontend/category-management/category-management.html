@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>카테고리 관리</title>
+    <link rel="stylesheet" href="/category-management/category-management.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-top">
+                <button class="btn btn-secondary" onclick="history.back()">← 뒤로가기</button>
+                <h1>📁 카테고리 관리</h1>
+            </div>
+            <nav>
+                <a href="/static/effort-management.html" class="nav-link">공수 관리</a>
+                <a href="/static/category-management.html" class="nav-link active">카테고리 관리</a>
+            </nav>
+        </header>
+
+        <main>
+            <!-- 엑셀 파일 업로드 섹션 -->
+            <section class="excel-upload-section">
+                <h2>📁 엑셀 파일로 카테고리 업데이트</h2>
+                <div class="upload-form">
+                    <div class="form-group">
+                        <label for="excelFile">엑셀 파일 선택 (.xlsx, .xls)</label>
+                        <input type="file" id="excelFile" accept=".xlsx,.xls" class="file-input">
+                    </div>
+                    <div class="button-group">
+                        <button onclick="uploadExcelCategories()" class="btn btn-success">엑셀 파일 업로드</button>
+                        <button onclick="downloadExcelCategories()" class="btn btn-info">현재 카테고리 다운로드</button>
+                    </div>
+                    <div id="uploadResult" class="upload-result"></div>
+                </div>
+                <div class="excel-format-info">
+                    <h4>📋 엑셀 파일 형식</h4>
+                    <p>첫 번째 행: <strong>대분류</strong> | <strong>중분류</strong> | <strong>소분류</strong></p>
+                    <p>예시:</p>
+                    <table class="format-example">
+                        <tr><th>대분류</th><th>중분류</th><th>소분류</th></tr>
+                        <tr><td>톡상담</td><td>실시간채팅</td><td>채팅방생성</td></tr>
+                        <tr><td>톡상담</td><td>실시간채팅</td><td>메시지전송</td></tr>
+                        <tr><td>메일상담</td><td>메일발송</td><td>자동발송</td></tr>
+                    </table>
+                </div>
+            </section>
+
+            <!-- 카테고리 목록 섹션 -->
+            <section class="category-list-section">
+                <h2>📋 카테고리 목록</h2>
+                <div class="category-tree" id="categoryTree">
+                    <!-- 카테고리 트리가 여기에 동적으로 생성됩니다 -->
+                </div>
+            </section>
+
+            <!-- 카테고리 수정 모달 -->
+            <div id="editModal" class="modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3>카테고리 수정</h3>
+                        <span class="close">&times;</span>
+                    </div>
+                    <form id="editCategoryForm" class="category-form">
+                        <input type="hidden" id="editOldMajor" name="old_major">
+                        <input type="hidden" id="editOldMinor" name="old_minor">
+                        <input type="hidden" id="editOldSub" name="old_sub">
+                        
+                        <div class="form-group">
+                            <label for="editMajorCategory">대분류 *</label>
+                            <input type="text" id="editMajorCategory" name="new_major" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="editMinorCategory">중분류 *</label>
+                            <input type="text" id="editMinorCategory" name="new_minor" required>
+                        </div>
+                        <div class="form-group">
+                            <label for="editSubCategory">소분류 *</label>
+                            <input type="text" id="editSubCategory" name="new_sub" required>
+                        </div>
+                        <div class="form-actions">
+                            <button type="button" class="btn btn-secondary" onclick="closeEditModal()">취소</button>
+                            <button type="submit" class="btn btn-primary">수정</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- 토스트 메시지 -->
+    <div id="toast" class="toast"></div>
+
+    <script src="/category-management/category-management.js"></script>
+</body>
+</html>

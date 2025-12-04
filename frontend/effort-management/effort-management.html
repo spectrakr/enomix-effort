@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>📊 공수 산정 관리 시스템</title>
+  <link rel="stylesheet" href="/effort-management/effort-management.css">
+</head>
+<body>
+  <div class="dashboard-container">
+    <!-- 헤더 -->
+    <header class="dashboard-header">
+      <div class="header-content">
+        <h1 onclick="switchTab('chat')">공수 산정 관리 시스템</h1>
+        <div class="header-actions">
+          <button class="btn btn-secondary" onclick="window.location.href='/category-management/category-management.html'">
+            카테고리 관리
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <div class="dashboard-layout">
+      <!-- 사이드바 -->
+      <aside class="sidebar">
+        <nav class="sidebar-nav">
+          <div class="nav-item active" data-tab="chat" onclick="switchTab('chat')">
+            <span class="nav-text">질의응답</span>
+          </div>
+          <div class="nav-item" data-tab="add" onclick="switchTab('add')">
+            <span class="nav-text">직접 입력</span>
+          </div>
+          <div class="nav-item" data-tab="sync" onclick="switchTab('sync')">
+            <span class="nav-text">Jira 가져오기</span>
+          </div>
+          <div class="nav-item" data-tab="stats" onclick="switchTab('stats')">
+            <span class="nav-text">통계</span>
+          </div>
+          <div class="nav-item" data-tab="list" onclick="switchTab('list')">
+            <span class="nav-text">데이터 목록</span>
+          </div>
+        </nav>
+      </aside>
+
+      <!-- 메인 콘텐츠 -->
+      <main class="main-content">
+        <!-- 질의응답 탭 -->
+        <div id="chat" class="tab-content active">
+      <div class="section">
+        <h2>공수 산정 질의응답</h2>
+        <div class="chat-container" id="chatBox"></div>
+        <div class="chat-input-container">
+          <div class="form-group">
+            <textarea id="effortQuestion" placeholder="공수 산정에 대해 질문해보세요... (예: 로그인 기능 개발에 얼마나 걸릴까요?)" onkeypress="handleKeyPress(event)"></textarea>
+          </div>
+          <button onclick="askEffortQuestion()" class="btn btn-primary">질문하기</button>
+        </div>
+        <div id="effortLoading" class="loading" style="display: none;">🤖 AI가 답변을 생성 중입니다...</div>
+      </div>
+    </div>
+
+    <!-- 직접 입력 탭 -->
+    <div id="add" class="tab-content">
+      <div class="section">
+        <h2>공수 산정 직접 입력</h2>
+        <form id="effortForm">
+          <div class="form-row">
+            <div class="form-group">
+              <label for="jiraTicket">Jira 티켓 <span class="required-asterisk">*</span></label>
+              <input type="text" id="jiraTicket" required placeholder="ENOMIX-123">
+            </div>
+            <div class="form-group">
+              <label for="title">제목 <span class="required-asterisk">*</span></label>
+              <input type="text" id="title" required placeholder="사용자 인증 기능">
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="storyPoints">Story Points <span class="required-asterisk">*</span></label>
+              <input type="number" id="storyPoints" step="0.5" min="0" required placeholder="5">
+            </div>
+            <div class="form-group">
+              <label for="teamMember">담당자</label>
+              <input type="text" id="teamMember" placeholder="김개발">
+            </div>
+          </div>
+
+          <!-- 카테고리 선택 필드 -->
+          <div class="form-row">
+            <div class="form-group">
+              <label for="majorCategory">대분류</label>
+              <select id="majorCategory" onchange="loadMinorCategories()">
+                <option value="">선택하세요</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="minorCategory">중분류</label>
+              <select id="minorCategory" onchange="loadSubCategories()" disabled>
+                <option value="">대분류를 먼저 선택하세요</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="subCategory">소분류</label>
+              <select id="subCategory" disabled>
+                <option value="">중분류를 먼저 선택하세요</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group" style="flex: 1;">
+              <label for="estimationReason">산정 이유</label>
+              <textarea id="estimationReason" placeholder="공수 산정 근거를 입력하세요..." style="flex: 1; height: 100px; resize: vertical;"></textarea>
+            </div>
+          </div>
+
+          <button type="button" onclick="addEffortData()" class="btn btn-primary">데이터 추가</button>
+        </form>
+      </div>
+    </div>
+
+    <!-- Jira 가져오기 탭 -->
+    <div id="sync" class="tab-content">
+      <!-- Epic 하위 작업 동기화 섹션 -->
+      <div class="section">
+        <h2>Epic 하위 작업 일괄 가져오기</h2>
+        <div style="background: #fff3e0; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #ff9800;">
+          <strong>Epic 하위 작업:</strong> Epic에 연결된 모든 Task 타입 작업을 일괄 가져옵니다<br>
+          <strong>카테고리:</strong> 가져온 후 데이터 목록에서 개별적으로 수정 가능합니다
+        </div>
+        
+        <div class="form-row">
+          <div class="form-group">
+            <label for="epicKey">Epic 키 <span class="required-asterisk">*</span></label>
+            <input type="text" id="epicKey" required placeholder="예: ENOMIX-1234">
+          </div>
+        </div>
+        
+        <div class="form-row">
+          <button onclick="syncEpicData()" class="btn btn-warning">Epic 하위 작업 가져오기</button>
+        </div>
+        <div id="epicSyncStatus" class="loading" style="display: none;">🔄 Epic 하위 작업을 가져오는 중입니다...</div>
+      </div>
+
+      <!-- 개별 티켓 동기화 섹션 -->
+      <div class="section">
+        <h2>개별 티켓 가져오기</h2>
+        <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3;">
+          <strong>허용된 티켓 타입:</strong> 작업, 스토리, 버그, Story, Task, Bug<br>
+          <strong>제외된 타입:</strong> Epic, Sub-task 등
+        </div>
+        
+        <div class="form-row">
+          <div class="form-group">
+            <label for="jiraTicketKey">Jira 티켓 키 <span class="required-asterisk">*</span></label>
+            <input type="text" id="jiraTicketKey" required placeholder="예: ENOMIX-123, ENOMIX-135">
+          </div>
+        </div>
+
+        <!-- 개별 티켓 동기화용 카테고리 선택 필드 -->
+        <div class="form-row">
+          <div class="form-group">
+            <label for="syncMajorCategory">대분류</label>
+            <select id="syncMajorCategory" onchange="loadSyncMinorCategories()">
+              <option value="">선택하세요</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="syncMinorCategory">중분류</label>
+            <select id="syncMinorCategory" onchange="loadSyncSubCategories()" disabled>
+              <option value="">대분류를 먼저 선택하세요</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="syncSubCategory">소분류</label>
+            <select id="syncSubCategory" disabled>
+              <option value="">중분류를 먼저 선택하세요</option>
+            </select>
+          </div>
+        </div>
+        
+        <div class="form-row">
+          <button onclick="syncJiraData()" class="btn btn-info">개별 티켓 가져오기</button>
+        </div>
+        <div id="syncStatus" class="loading" style="display: none;">🔄 Jira 데이터를 가져오는 중입니다...</div>
+      </div>
+    </div>
+
+    <!-- 통계 탭 -->
+    <div id="stats" class="tab-content">
+      <div class="section">
+        <h2>공수 산정 통계</h2>
+        <div id="statisticsContent" class="loading">📊 통계를 로드 중입니다...</div>
+      </div>
+    </div>
+
+    <!-- 데이터 목록 탭 -->
+    <div id="list" class="tab-content">
+      <div class="section">
+        <h2>공수 산정 데이터 목록</h2>
+        
+        <!-- 자동 분류 버튼 -->
+        <div style="margin-bottom: 20px; padding: 15px; background: #e3f2fd; border-radius: 8px; border-left: 4px solid #2196f3;">
+          <button onclick="autoClassifyData()" class="btn btn-primary" style="width: 100%;">
+            🤖 미분류 데이터 자동 분류
+          </button>
+          <div id="autoClassifyStatus" style="margin-top: 10px;"></div>
+        </div>
+        
+        <!-- 검색 및 페이징 컨트롤 -->
+        <div class="search-pagination-controls">
+          <div class="search-section">
+            <div class="search-input-group">
+              <input type="text" id="titleSearchInput" placeholder="제목 또는 Jira 티켓으로 검색..." class="search-input" onkeypress="handleSearchKeyPress(event)">
+              <button onclick="searchByTitle()" class="btn btn-primary">검색</button>
+              <button onclick="clearTitleSearch()" class="btn btn-secondary">초기화</button>
+            </div>
+          </div>
+          <div class="pagination-buttons">
+            <button id="prevPageBtn" onclick="changePage(-1)" class="btn btn-secondary" disabled>이전</button>
+            <span id="pageNumbers" class="page-numbers"></span>
+            <button id="nextPageBtn" onclick="changePage(1)" class="btn btn-secondary" disabled>다음</button>
+          </div>
+        </div>
+        
+        <div id="effortListContent" class="loading">📋 데이터 목록을 로드 중입니다...</div>
+      </div>
+    </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <!-- 카테고리 수정 모달 -->
+  <div id="categoryEditModal" class="modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>카테고리 수정</h3>
+        <span class="close" onclick="closeCategoryEditModal()">&times;</span>
+      </div>
+      <form id="categoryEditForm" class="category-form">
+        <input type="hidden" id="editJiraTicket" name="jira_ticket">
+        
+        <div class="form-group">
+          <label>Jira 티켓</label>
+          <input type="text" id="editJiraTicketDisplay" readonly style="background-color: #f8f9fa;">
+        </div>
+        
+        <div class="form-group">
+          <label>제목</label>
+          <input type="text" id="editTitle" readonly style="background-color: #f8f9fa;">
+        </div>
+        
+        <div class="form-group">
+          <label for="editMajorCategory">대분류 *</label>
+          <select id="editMajorCategory" name="major_category" required onchange="loadEditMinorCategories()">
+            <option value="">선택하세요</option>
+          </select>
+        </div>
+        
+        <div class="form-group">
+          <label for="editMinorCategory">중분류 *</label>
+          <select id="editMinorCategory" name="minor_category" required onchange="loadEditSubCategories()" disabled>
+            <option value="">대분류를 먼저 선택하세요</option>
+          </select>
+        </div>
+        
+        <div class="form-group">
+          <label for="editSubCategory">소분류 *</label>
+          <select id="editSubCategory" name="sub_category" required disabled>
+            <option value="">중분류를 먼저 선택하세요</option>
+          </select>
+        </div>
+        
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" onclick="closeCategoryEditModal()">취소</button>
+          <button type="submit" class="btn btn-primary">수정</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/effort-management/effort-management.js"></script>
+</body>
+</html>

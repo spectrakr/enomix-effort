@@ -1,0 +1,2172 @@
+from fastapi import FastAPI, UploadFile, File, Form, Request, BackgroundTasks, Header
+# import pandas as pd  # pandas 없이 작동하도록 주석 처리
+import io
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from bs4 import BeautifulSoup
+from typing import List, Dict, Any
+import requests
+
+import os
+import re
+import shutil
+import logging
+import json
+from datetime import datetime
+
+
+from ..utils.config import STATIC_DIR, DOCS_DIR, LOG_DIR, CHROMA_DIR
+from ..data.database import (
+    get_vectordb,
+    index_document,
+    get_indexed_files,
+    remove_document,
+    reset_vectordb,
+    save_feedback_to_file,
+    get_feedback_vectordb,
+    index_json_data
+)
+# semantic_search 모듈 제거됨
+from ..utils.slack import clean_mention, post_slack_reply, handle_slack_message
+from ..utils.utils import format_sources
+
+# qa_utils 모듈 제거됨
+from ..services.category_classifier import auto_classify
+from slack_sdk.web.async_client import AsyncWebClient
+from ..services.effort_estimation import EffortEstimation, effort_manager
+from ..services.effort_qa import run_effort_qa_chain, run_effort_qa_with_feedback, get_effort_statistics, search_similar_features
+from ..data.database import get_vectordb, index_document
+from ..services.jira_integration import create_jira_integration
+from ..services.mock_qa import mock_qa_response, mock_effort_qa_response
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+from data.prompts import intent_prompt_manager
+
+# Configure logging
+from ..utils.config import LOG_DIR
+
+# 로그 디렉토리 확인
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# 로그 파일 설정 (재기동 시 초기화)
+log_file = os.path.join(LOG_DIR, "app.log")
+
+# 파일 핸들러 (재기동 시 초기화를 위해 mode='w' 사용)
+file_handler = logging.FileHandler(log_file, mode='w', encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+file_handler.setFormatter(file_formatter)
+
+# 콘솔 핸들러
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+console_handler.setFormatter(console_formatter)
+
+# 루트 로거 설정
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+logger = logging.getLogger(__name__)
+logger.info(f"📝 로그 파일 설정 완료: {log_file}")
+
+# Create FastAPI app
+app = FastAPI()
+
+# 기존 관리자 페이지 제거됨
+
+@app.get("/")
+async def root():
+    """메인 페이지 - effort-management로 리다이렉트"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/effort-management/effort-management.html")
+
+@app.get("/effort")
+async def effort_management():
+    """기존 /effort 경로 - effort-management로 리다이렉트"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/effort-management/effort-management.html")
+
+@app.get("/static/effort-management.html")
+async def static_effort_redirect():
+    """기존 /static 경로 - effort-management로 리다이렉트"""
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/effort-management/effort-management.html")
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        logger.info("🚀 Server starting up...")
+        # 벡터 DB 기능 비활성화로 인덱싱 스킵
+        logger.info("📚 Startup indexing skipped (vector DB disabled)")
+        
+        # 카테고리 자동 마이그레이션
+        await auto_migrate_categories()
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        logger.error(f"❌ Error during startup: {str(e)}")
+
+async def auto_migrate_categories():
+    """카테고리 변경 시 자동 마이그레이션"""
+    try:
+        logger.info("📊 카테고리 변경 감지 중...")
+        
+        # 현재 카테고리 로드
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        current_categories = category_manager.get_categories()
+        
+        # 기존 카테고리 파일 로드 (categories.json)
+        import os
+        categories_file = os.path.join(DOCS_DIR, "categories.json")
+        
+        if not os.path.exists(categories_file):
+            logger.warning("카테고리 파일을 찾을 수 없습니다")
+            return
+        
+        # 모든 공수 산정 데이터 가져오기
+        estimations = effort_manager.get_all_estimations()
+        
+        # 카테고리 변경 감지 및 자동 마이그레이션
+        updated_count = 0
+        reset_count = 0
+        
+        for estimation in estimations:
+            if not estimation.major_category or not estimation.minor_category or not estimation.sub_category:
+                continue
+            
+            # 현재 카테고리 구조에서 해당 카테고리가 존재하는지 확인
+            major = estimation.major_category
+            minor = estimation.minor_category
+            sub = estimation.sub_category
+            
+            # 대중소분류가 모두 정확히 일치하는지 확인
+            is_valid = (
+                major in current_categories and
+                minor in current_categories.get(major, {}) and
+                sub in current_categories.get(major, {}).get(minor, [])
+            )
+            
+            if is_valid:
+                # 정확히 일치하는 경우: 그대로 유지 (변경 없음)
+                logger.debug(f"✅ 카테고리 유지: {major} > {minor} > {sub}")
+            else:
+                # 하나라도 안 맞는 경우: 카테고리 초기화 (사용자가 다시 선택하도록)
+                logger.info(f"🔄 카테고리 초기화: {major} > {minor} > {sub} -> (초기화됨, 재선택 필요)")
+                estimation.major_category = None
+                estimation.minor_category = None
+                estimation.sub_category = None
+                reset_count += 1
+        
+        if reset_count > 0:
+            # 변경사항 저장
+            effort_manager.save_data()
+            logger.info(f"✅ 카테고리 자동 마이그레이션 완료: {reset_count}개 데이터 카테고리 초기화 (재선택 필요)")
+        else:
+            logger.info("📊 카테고리 변경 사항 없음 (모든 카테고리가 정확히 일치함)")
+        
+    except Exception as e:
+        logger.error(f"❌ 카테고리 자동 마이그레이션 오류: {str(e)}")
+
+@app.post("/upload_pdf/")
+async def upload_pdf(file: UploadFile = File(...)):
+    try:
+        file_path = os.path.join(DOCS_DIR, file.filename)
+        with open(file_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+            
+        if index_document(file_path, "pdf"):
+            return {"message": f"'{file.filename}' indexed successfully"}
+        else:
+            return JSONResponse(status_code=500, content={"error": "Failed to index document"})
+            
+    except Exception as e:
+        logger.error(f"❌ Error uploading PDF: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+def extract_questions(text: str) -> set:
+    """Q1:, Q2: 형식으로 시작하는 질문 추출"""
+    return set(
+        m.strip()
+        for m in re.findall(r"Q\d+:\s*(.+?)(?:\n|$)", text)
+    )
+
+
+@app.post("/upload_text/")
+async def upload_text(text: str = Form(...), source: str = Form(...)):
+    try:
+        # 1. 입력값 검증
+        if not text.strip():
+            return JSONResponse(status_code=400, content={"error": "텍스트 내용이 비어있습니다."})
+
+        safe_source = re.sub(r'[\\/]', '_', source.strip()) or "TEMP"
+        txt_filename = f"{safe_source}.txt"
+        txt_path = os.path.join(DOCS_DIR, txt_filename)
+
+        logger.info(f"📝 텍스트 업로드 요청 - source: {safe_source}")
+
+        # 2. 중복 질문 필터링
+        new_questions = extract_questions(text.strip())
+        existing_text = ""
+        existing_questions = set()
+
+        if os.path.exists(txt_path):
+            with open(txt_path, "r", encoding="utf-8") as f:
+                existing_text = f.read()
+                existing_questions = extract_questions(existing_text)
+
+        duplicated = new_questions & existing_questions
+        if duplicated:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "message": "일부 또는 전체 질문이 이미 존재합니다.",
+                    "duplicated_questions": list(duplicated)
+                }
+            )
+
+        # 3. 텍스트 파일에 append 저장
+        with open(txt_path, "a", encoding="utf-8") as f:
+            if existing_text:
+                f.write("\n")
+            f.write(text.strip())
+
+        # 4. 색인 처리 (database.py의 index_document 호출)
+        if index_document(txt_path, file_type="txt", force=True):
+            logger.info(f"✅ '{safe_source}' 텍스트 색인 완료")
+            return {
+                "message": f"'{safe_source}' 텍스트가 성공적으로 추가되고 재색인되었습니다.",
+            }
+        else:
+            return JSONResponse(status_code=500, content={"error": "문서 색인 실패"})
+
+    except Exception as e:
+        logger.error(f"❌ upload_text 오류: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/indexed_files/")
+async def get_indexed_files_endpoint():
+    try:
+        files = get_indexed_files()
+        # Add download URLs for each file
+        files_with_urls = [
+            {
+                "filename": filename,
+                "download_url": f"/download/{filename}"
+            }
+            for filename in files
+        ]
+        return {"indexed_files": files_with_urls}
+    except Exception as e:
+        logger.error(f"❌ Error getting indexed files: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    try:
+        # Validate file extension
+        if not filename.endswith((".pdf", ".txt")):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Only .pdf and .txt files are supported"}
+            )
+            
+        file_path = os.path.join(DOCS_DIR, filename)
+        
+        if not os.path.exists(file_path):
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"File '{filename}' not found"}
+            )
+            
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type="application/octet-stream"
+        )
+            
+    except Exception as e:
+        logger.error(f"❌ Error downloading file: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.post("/ask/")
+async def ask_question(question: str = Form(...)):
+    try:
+        logger.info(f"💬 Question received: {question}")
+        
+        # 일반 질문은 모의 응답 사용
+        result = mock_qa_response(question)
+
+        if "error" in result:
+            return JSONResponse(status_code=400, content={"error": result["error"]})
+        
+        sources_text = format_sources(result["sources"])
+
+        return {
+            "question": result["question"],
+            "answer": result["answer"],
+            # "sources": result["sources"],
+            "formatted_response": f"{result['answer']}{sources_text}"
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error processing question: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/slack/test")
+async def slack_test():
+    """슬랙봇 연결 테스트"""
+    return {"status": "success", "message": "슬랙봇이 정상적으로 연결되었습니다!"}
+
+@app.post("/slack/test")
+async def slack_test_post(request: Request):
+    """슬랙 URL 검증 테스트"""
+    try:
+        data = await request.json()
+        logger.info(f"🧪 테스트 POST 요청 수신: {data}")
+        
+        if data.get("type") == "url_verification":
+            challenge = data.get("challenge")
+            logger.info(f"🔐 테스트 URL 인증 - Challenge: {challenge}")
+            return {"challenge": challenge}
+        
+        return {"status": "success", "received": data}
+    except Exception as e:
+        logger.error(f"❌ 테스트 POST 오류: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/slack/events")
+async def slack_event_listener(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_slack_retry_num: str = Header(default=None),
+    x_slack_retry_reason: str = Header(default=None)
+):
+    try:
+        # 요청 로깅
+        logger.info(f"🔔 Slack 이벤트 수신 - Retry: {x_slack_retry_num}, Reason: {x_slack_retry_reason}")
+        
+        data = await request.json()
+        logger.info(f"📦 수신된 데이터: {data}")
+
+        # 중복 전송 방지
+        if x_slack_retry_num:
+            logger.info("⏭️ 중복 요청으로 인한 스킵")
+            return {"status": "ok"}
+
+        # Slack URL 인증
+        if data.get("type") == "url_verification":
+            challenge = data.get("challenge")
+            logger.info(f"🔐 URL 인증 요청 - Challenge: {challenge}")
+            return {"challenge": challenge}
+
+        # 실제 이벤트 처리
+        if data.get("type") == "event_callback":
+            event = data.get("event", {})
+            event_type = event.get("type")
+            user = event.get("user", "알 수 없음")
+            
+            logger.info(f"📨 이벤트 타입: {event_type}, 사용자: {user}")
+
+            # 앱 멘션
+            if event_type == "app_mention":
+                channel = event.get("channel")
+                thread_ts = event.get("thread_ts", event.get("ts"))
+                text = clean_mention(event.get("text", ""))
+                logger.info(f"📥 채널 수신된 메시지 {user}: {text}")
+                background_tasks.add_task(handle_slack_message, text, channel, thread_ts, event.get("ts"))
+
+            # DM 메시지
+            elif event_type == "message" and event.get("channel_type") == "im" and not event.get("bot_id"):
+                channel = event.get("channel")
+                text = clean_mention(event.get("text", ""))  # 멘션 제거 추가
+                logger.info(f"📥 앱 메세지 탭 수신된 메시지 {user} : {text}")
+                background_tasks.add_task(handle_slack_message, text, channel, None, event.get("ts"))
+            
+            # 이모지 리액션 이벤트 (피드백 수집)
+            elif event_type == "reaction_added":
+                logger.info(f"👍 reaction_added 이벤트 수신! reaction={event.get('reaction')}, item={event.get('item')}")
+                from ..utils.slack import handle_slack_reaction
+                background_tasks.add_task(handle_slack_reaction, event)
+            
+            else:
+                logger.info(f"ℹ️ 처리되지 않은 이벤트 타입: {event_type}")
+
+        logger.info("✅ Slack 이벤트 처리 완료")
+        return {"status": "ok"}
+
+    except Exception as e:
+        logger.error(f"❌ Error handling Slack event: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+
+
+
+@app.delete("/files/{filename}")
+async def delete_file(filename: str):
+    try:
+        # Validate file extension
+        if not filename.endswith((".pdf", ".txt")):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Only .pdf and .txt files are supported"}
+            )
+            
+        file_path = os.path.join(DOCS_DIR, filename)
+        
+        if remove_document(file_path):
+            return {"message": f"File '{filename}' deleted successfully"}
+        else:
+            return JSONResponse(
+                status_code=404,
+                content={"error": f"File '{filename}' not found"}
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ Error deleting file: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
+@app.post("/indexed_files")
+async def reindex_all_files():
+    try:
+        logger.info("🔄 Starting complete reindexing process...")
+        
+        # First, reset the Chroma DB
+        if not reset_vectordb():
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to reset database"}
+            )
+        
+        logger.info("🗑️ Database reset complete, starting reindexing...")
+        indexed_count = 0
+        error_count = 0
+        
+        # Get list of all files
+        for filename in os.listdir(DOCS_DIR):
+            if filename.endswith((".pdf", ".txt")):
+                file_path = os.path.join(DOCS_DIR, filename)
+                file_type = "pdf" if filename.endswith(".pdf") else "txt"
+                
+                try:
+                    # No need for force=True since DB is fresh
+                    if index_document(file_path, file_type):
+                        indexed_count += 1
+                        logger.info(f"✅ Indexed: {filename}")
+                    else:
+                        error_count += 1
+                        logger.error(f"❌ Failed to index: {filename}")
+                except Exception as e:
+                    error_count += 1
+                    logger.error(f"❌ Error indexing {filename}: {str(e)}")
+        
+        message = f"전체 재색인 완료: {indexed_count}개 성공"
+        if error_count > 0:
+            message += f", {error_count}개 실패"
+            
+        logger.info(message)
+        return {"message": message}
+        
+    except Exception as e:
+        error_msg = f"❌ Error during reindexing: {str(e)}"
+        logger.error(error_msg)
+        return JSONResponse(status_code=500, content={"error": error_msg})
+
+@app.post("/index_url/")
+async def upload_url(url: str = Form(...), source: str = Form(default="web")):
+    try:
+        logger.info(f"🌐 URL 크롤링 요청: {url}")
+
+        # ✅ 웹 페이지 요청 및 파싱
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200:
+            return JSONResponse(status_code=400, content={"error": f"Failed to fetch URL: {response.status_code}"})
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # ✅ 주요 태그 위주로 텍스트 구조화
+        lines = []
+
+        # 제목 계열 먼저
+        for header in soup.find_all(['h1', 'h2', 'h3', 'h4']):
+            lines.append(f"# {header.get_text(strip=True)}")
+
+        # 단락
+        for paragraph in soup.find_all('p'):
+            lines.append(paragraph.get_text(strip=True))
+
+        # 리스트
+        for li in soup.find_all('li'):
+            lines.append(f"- {li.get_text(strip=True)}")
+
+        # 기타 텍스트 누락 방지용 (기본적 body에서 추가로 가져오기)
+        body_text = soup.body.get_text(separator="\n", strip=True) if soup.body else ""
+        lines.append(body_text)
+
+        # 중복 제거 및 정리
+        clean_lines = []
+        for line in lines:
+            line = line.strip()
+            if line and line not in clean_lines:
+                clean_lines.append(line)
+
+        text = "\n".join(clean_lines)
+
+        # ✅ 파일 저장
+        safe_source = re.sub(r'[\\/]', '_', source.strip()) or "web"
+        txt_filename = f"{safe_source}.txt"
+        txt_path = os.path.join(DOCS_DIR, txt_filename)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+        # ✅ 색인 처리
+        if index_document(txt_path, "txt", force=True):
+            return {"message": f"'{url}' 크롤링 및 색인 성공", "source": txt_filename}
+        else:
+            return JSONResponse(status_code=500, content={"error": "문서 색인 실패"})
+
+    except Exception as e:
+        logger.error(f"❌ upload_url 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ask_preview 엔드포인트 제거됨
+
+# ==================== 공수 산정 관련 엔드포인트 ====================
+
+@app.post("/effort/add/")
+async def add_effort_estimation(
+    jira_ticket: str = Form(...),
+    title: str = Form(...),
+    story_points: float = Form(...),
+    estimation_reason: str = Form(default=None),
+    tech_stack: str = Form(default=None),
+    team_member: str = Form(default=None),
+    notes: str = Form(default=None),
+    major_category: str = Form(default=None),
+    minor_category: str = Form(default=None),
+    sub_category: str = Form(default=None),
+    auto_classify: bool = Form(default=False)
+):
+    """수동으로 공수 산정 데이터 추가 (Story Point 기반)"""
+    try:
+        # 기술 스택 파싱
+        tech_stack_list = None
+        if tech_stack:
+            tech_stack_list = [tech.strip() for tech in tech_stack.split(',')]
+        
+        # 자동 분류 활성화 시
+        if auto_classify:
+            predicted_category, confidence = auto_classify(title)
+            if predicted_category and confidence > 0.5:
+                logger.info(f"자동 분류 결과: {predicted_category} (신뢰도: {confidence:.2f})")
+                # 예측된 카테고리를 사용
+                category_parts = predicted_category.split(' > ')
+                if len(category_parts) >= 3:
+                    major_category = category_parts[0]
+                    minor_category = category_parts[1]
+                    sub_category = category_parts[2]
+            else:
+                logger.warning(f"자동 분류 신뢰도 부족: {confidence:.2f}")
+        
+        estimation = EffortEstimation(
+            jira_ticket=jira_ticket,
+            title=title,
+            story_points=story_points,
+            estimation_reason=estimation_reason,
+            tech_stack=tech_stack_list,
+            team_member=team_member,
+            notes=notes,
+            major_category=major_category,
+            minor_category=minor_category,
+            sub_category=sub_category
+        )
+        
+        if effort_manager.add_estimation(estimation):
+            # 공수 산정 데이터를 색인에 추가
+            effort_text = effort_manager.format_for_indexing()
+            effort_file_path = os.path.join(DOCS_DIR, "effort_estimations.txt")
+            with open(effort_file_path, "w", encoding="utf-8") as f:
+                f.write(effort_text)
+            
+            # 색인 업데이트
+            index_document(effort_file_path, "txt", force=True)
+            
+            return {"message": f"공수 산정 데이터가 성공적으로 추가되었습니다: {title}"}
+        else:
+            return JSONResponse(status_code=500, content={"error": "공수 산정 데이터 추가 실패"})
+            
+    except Exception as e:
+        logger.error(f"❌ 공수 산정 데이터 추가 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+def save_web_qa_mapping(question: str, answer: str, sources: list = None):
+    """웹 QA 매핑 저장"""
+    try:
+        web_mapping_file = os.path.join(DOCS_DIR, "web_qa_mapping.json")
+        
+        # 기존 매핑 로드
+        web_qa_mapping = {}
+        if os.path.exists(web_mapping_file):
+            try:
+                with open(web_mapping_file, 'r', encoding='utf-8') as f:
+                    web_qa_mapping = json.load(f)
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"⚠️ 웹 QA 매핑 파일 읽기 오류: {e}, 빈 딕셔너리로 시작")
+                web_qa_mapping = {}
+        
+        # 새로운 QA 항목 추가 (타임스탬프를 키로 사용)
+        qa_id = datetime.now().isoformat()
+        web_qa_mapping[qa_id] = {
+            "question": question,
+            "answer": answer,
+            "sources": sources or [],
+            "timestamp": qa_id,
+            "source": "web"
+        }
+        
+        # 파일 저장
+        with open(web_mapping_file, 'w', encoding='utf-8') as f:
+            json.dump(web_qa_mapping, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"💾 웹 QA 매핑 저장: {question[:30]}...")
+        return True
+    except Exception as e:
+        logger.error(f"❌ 웹 QA 매핑 저장 오류: {str(e)}")
+        return False
+
+@app.post("/effort/ask/")
+async def ask_effort_question(question: str = Form(...)):
+    """공수 산정 관련 질문"""
+    try:
+        logger.info(f"💬 공수 산정 질문 수신: {question}")
+        
+        try:
+            result = run_effort_qa_chain(question)
+        except Exception as e:
+            if "quota" in str(e).lower() or "insufficient_quota" in str(e).lower():
+                logger.warning("⚠️ OpenAI API 할당량 초과, 공수 산정 모의 응답 사용")
+                result = mock_effort_qa_response(question)
+            else:
+                raise e
+        
+        if "error" in result:
+            return JSONResponse(status_code=400, content={"error": result["error"]})
+        
+        # 웹 QA 매핑 저장
+        save_web_qa_mapping(
+            question=result["question"],
+            answer=result["answer"],
+            sources=result.get("sources", [])
+        )
+        
+        sources_text = format_sources(result["sources"])
+        
+        return {
+            "question": result["question"],
+            "answer": result["answer"],
+            "formatted_response": f"{result['answer']}{sources_text}",
+            "feedback_enabled": result.get("feedback_enabled", False),
+            "search_session_id": result.get("search_session_id", ""),
+            "sources": result.get("sources", [])
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 공수 산정 질문 처리 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/ask-feedback/")
+async def ask_effort_question_with_feedback(request: dict):
+    """피드백 기반 공수 산정 질문 재검색"""
+    try:
+        question = request.get("question", "")
+        excluded_sources = request.get("excluded_sources", [])
+        
+        logger.info(f"🔄 피드백 기반 공수 산정 질문 수신: {question}")
+        logger.info(f"🚫 제외할 소스: {excluded_sources}")
+        
+        try:
+            result = run_effort_qa_with_feedback(question, excluded_sources)
+        except Exception as e:
+            if "quota" in str(e).lower() or "insufficient_quota" in str(e).lower():
+                logger.warning("⚠️ OpenAI API 할당량 초과, 공수 산정 모의 응답 사용")
+                result = mock_effort_qa_response(question)
+            else:
+                raise e
+        
+        if "error" in result:
+            return JSONResponse(status_code=400, content={"error": result["error"]})
+        
+        sources_text = format_sources(result["sources"])
+        
+        return {
+            "question": result["question"],
+            "answer": result["answer"],
+            "formatted_response": f"{result['answer']}{sources_text}",
+            "feedback_enabled": result.get("feedback_enabled", False),
+            "search_session_id": result.get("search_session_id", ""),
+            "sources": result.get("sources", []),
+            "is_feedback_search": result.get("is_feedback_search", False)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 피드백 기반 공수 산정 질문 처리 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/statistics/")
+async def get_effort_statistics_endpoint():
+    """공수 산정 통계 조회"""
+    try:
+        stats = get_effort_statistics()
+        return stats
+    except Exception as e:
+        logger.error(f"❌ 공수 산정 통계 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/feedback-statistics/weekly-positive-ratio/")
+async def get_feedback_weekly_positive_ratio_endpoint():
+    """주 단위 긍정 피드백 비율 통계 조회"""
+    try:
+        from ..services.effort_qa import get_feedback_weekly_positive_ratio
+        stats = get_feedback_weekly_positive_ratio()
+        return stats
+    except Exception as e:
+        logger.error(f"❌ 주 단위 피드백 통계 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/search/{feature_name}")
+async def search_effort_features(feature_name: str):
+    """기능명으로 공수 산정 데이터 검색"""
+    try:
+        results = search_similar_features(feature_name)
+        return {"feature_name": feature_name, "results": results}
+    except Exception as e:
+        logger.error(f"❌ 공수 산정 검색 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/debug-search/")
+async def debug_search_effort_features(query: str):
+    """디버깅용 공수 산정 데이터 검색"""
+    try:
+        logger.info(f"🔍 디버깅 검색 요청: '{query}'")
+        
+        # 직접 데이터 검색
+        estimations = effort_manager.get_all_estimations()
+        logger.info(f"📊 전체 데이터 수: {len(estimations)}")
+        
+        # 제목으로 검색
+        matching_estimations = []
+        for est in estimations:
+            if query.lower() in est.title.lower():
+                matching_estimations.append({
+                    "jira_ticket": est.jira_ticket,
+                    "title": est.title,
+                    "story_points": est.story_points
+                })
+        
+        logger.info(f"🔍 매칭된 데이터 수: {len(matching_estimations)}")
+        
+        return {
+            "query": query,
+            "total_estimations": len(estimations),
+            "matching_estimations": matching_estimations,
+            "all_titles": [est.title for est in estimations[:10]]  # 처음 10개 제목만
+        }
+    except Exception as e:
+        logger.error(f"❌ 디버깅 검색 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/vector-status/")
+async def get_vector_db_status():
+    """벡터 DB 상태 확인"""
+    try:
+        logger.info("🔍 벡터 DB 상태 확인 시작")
+        
+        vectordb = get_vectordb()
+        collection = vectordb.get()
+        
+        # 소스별 문서 수 집계
+        source_counts = {}
+        for metadata in collection["metadatas"]:
+            if isinstance(metadata, dict):
+                source = metadata.get("source", "unknown")
+                source_counts[source] = source_counts.get(source, 0) + 1
+        
+        logger.info(f"📊 벡터 DB 전체 문서 수: {len(collection['ids'])}")
+        logger.info(f"📊 소스별 문서 수: {source_counts}")
+        
+        return {
+            "total_documents": len(collection['ids']),
+            "source_counts": source_counts,
+            "sources": list(source_counts.keys())
+        }
+    except Exception as e:
+        logger.error(f"❌ 벡터 DB 상태 확인 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/cleanup-temp/")
+async def cleanup_temp_files():
+    """TEMP.txt 파일 벡터 DB에서 제거"""
+    try:
+        logger.info("🧹 TEMP.txt 파일 정리 시작")
+        
+        vectordb = get_vectordb()
+        collection = vectordb.get()
+        
+        # TEMP.txt 관련 문서 ID 찾기
+        temp_doc_ids = []
+        for i, metadata in enumerate(collection["metadatas"]):
+            if isinstance(metadata, dict) and metadata.get("source") == "TEMP.txt":
+                temp_doc_ids.append(collection["ids"][i])
+        
+        if temp_doc_ids:
+            # TEMP.txt 문서들 삭제
+            vectordb._collection.delete(temp_doc_ids)
+            logger.info(f"🗑️ TEMP.txt 문서 {len(temp_doc_ids)}개 삭제 완료")
+            
+            return {
+                "message": f"TEMP.txt 파일 {len(temp_doc_ids)}개 문서가 벡터 DB에서 제거되었습니다.",
+                "removed_count": len(temp_doc_ids)
+            }
+        else:
+            return {
+                "message": "TEMP.txt 파일이 벡터 DB에 존재하지 않습니다.",
+                "removed_count": 0
+            }
+            
+    except Exception as e:
+        logger.error(f"❌ TEMP.txt 정리 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/reindex/")
+async def reindex_effort_data():
+    """공수 산정 데이터 재인덱싱"""
+    try:
+        logger.info("🔄 공수 산정 데이터 재인덱싱 시작")
+        
+        # effort_estimations.txt 파일 재인덱싱
+        effort_file_path = os.path.join(DOCS_DIR, "effort_estimations.txt")
+        
+        if os.path.exists(effort_file_path):
+            logger.info(f"📄 effort_estimations.txt 파일 발견: {effort_file_path}")
+            
+            # 강제 재인덱싱
+            if index_document(effort_file_path, file_type="txt", force=True):
+                logger.info("✅ effort_estimations.txt 재인덱싱 완료")
+                
+                # 벡터 DB 상태 확인
+                vectordb = get_vectordb()
+                collection = vectordb.get()
+                logger.info(f"📊 벡터 DB 문서 수: {len(collection['ids'])}")
+                
+                # effort_estimations.txt 관련 문서 수 확인
+                effort_docs = 0
+                for metadata in collection["metadatas"]:
+                    if isinstance(metadata, dict) and metadata.get("source") == "effort_estimations.txt":
+                        effort_docs += 1
+                
+                logger.info(f"📊 effort_estimations.txt 문서 수: {effort_docs}")
+                
+                return {
+                    "message": "공수 산정 데이터 재인덱싱 완료",
+                    "total_documents": len(collection['ids']),
+                    "effort_documents": effort_docs
+                }
+            else:
+                return JSONResponse(status_code=500, content={"error": "재인덱싱 실패"})
+        else:
+            return JSONResponse(status_code=404, content={"error": "effort_estimations.txt 파일을 찾을 수 없습니다"})
+            
+    except Exception as e:
+        logger.error(f"❌ 재인덱싱 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/sync-jira/")
+async def sync_jira_data(request: Request):
+    """Jira 티켓 데이터 동기화"""
+    try:
+        # 요청 데이터 로깅
+        logger.info(f"🔄 Jira 동기화 요청 수신 시작")
+        
+        # Content-Type 확인
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"🔄 Content-Type: {content_type}")
+        
+        # FormData 파싱
+        form_data = await request.form()
+        logger.info(f"🔄 FormData keys: {list(form_data.keys())}")
+        
+        ticket_key = form_data.get("ticket_key")
+        major_category = form_data.get("major_category")
+        minor_category = form_data.get("minor_category")
+        sub_category = form_data.get("sub_category")
+        logger.info(f"🔄 Jira 동기화 요청 수신: ticket_key={ticket_key}, categories={major_category}/{minor_category}/{sub_category}")
+        
+        if not ticket_key:
+            logger.error("❌ ticket_key 파라미터가 없습니다")
+            return JSONResponse(status_code=422, content={"error": "ticket_key 파라미터가 필요합니다"})
+        
+        jira = create_jira_integration()
+        if not jira:
+            logger.error("❌ Jira 설정이 없습니다")
+            return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+        
+        if not jira.test_connection():
+            logger.error("❌ Jira 연결 실패")
+            return JSONResponse(status_code=400, content={"error": "Jira 연결에 실패했습니다"})
+        
+        logger.info(f"🔄 티켓 '{ticket_key}' 동기화 시작")
+        result = jira.sync_ticket_data(ticket_key, major_category, minor_category, sub_category)
+        
+        if result["success"]:
+            # 색인 업데이트
+            effort_text = effort_manager.format_for_indexing()
+            effort_file_path = os.path.join(DOCS_DIR, "effort_estimations.txt")
+            with open(effort_file_path, "w", encoding="utf-8") as f:
+                f.write(effort_text)
+            
+            index_document(effort_file_path, "txt", force=True)
+            
+            logger.info(f"✅ 티켓 '{ticket_key}' 동기화 완료")
+            return {"message": f"티켓 '{ticket_key}' 데이터 동기화 완료"}
+        else:
+            # 티켓 타입 필터링인 경우 특별한 메시지 반환
+            if result["reason"] == "not_found_or_invalid_type":
+                logger.warning(f"⚠️ 허용되지 않은 티켓 타입: {ticket_key}")
+                return JSONResponse(
+                    status_code=400, 
+                    content={"error": f"Epic 타입의 티켓은 동기화할 수 없습니다. 허용된 타입: 작업, 스토리, 버그, Story, Task, Bug"}
+                )
+            elif result["reason"] == "no_estimation_data":
+                logger.warning(f"⚠️ 공수 데이터 없음: {ticket_key}")
+                return JSONResponse(status_code=400, content={"error": f"티켓 '{ticket_key}'에서 공수 데이터를 추출할 수 없습니다"})
+            else:
+                logger.error(f"❌ 티켓 '{ticket_key}' 동기화 실패")
+                return JSONResponse(status_code=500, content={"error": "Jira 데이터 동기화 실패"})
+            
+    except Exception as e:
+        logger.error(f"❌ Jira 동기화 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/list/")
+async def list_effort_estimations(
+    major_category: str = None,
+    minor_category: str = None,
+    sub_category: str = None,
+    search: str = None,
+    page: int = 1,
+    page_size: int = 100
+):
+    """공수 산정 데이터 목록 조회 (카테고리 필터링 지원)"""
+    try:
+        estimations = effort_manager.get_all_estimations()
+        
+        # 검색 적용 (제목 또는 Jira 티켓)
+        if search:
+            search_term = search.lower().strip()
+            filtered_estimations = []
+            for estimation in estimations:
+                # 제목에서 검색
+                if search_term in estimation.title.lower():
+                    filtered_estimations.append(estimation)
+                # Jira 티켓에서 검색
+                elif estimation.jira_ticket and search_term in estimation.jira_ticket.lower():
+                    filtered_estimations.append(estimation)
+            estimations = filtered_estimations
+        
+        # 페이징 처리
+        total_count = len(estimations)
+        total_pages = (total_count + page_size - 1) // page_size  # 올림 계산
+        
+        # 페이지 범위 계산
+        start_index = (page - 1) * page_size
+        end_index = start_index + page_size
+        
+        # 현재 페이지 데이터 추출
+        paginated_estimations = estimations[start_index:end_index]
+        
+        # 넘버링 추가 (전체 데이터 기준)
+        for i, estimation in enumerate(paginated_estimations):
+            estimation.sequence_number = start_index + i + 1
+        
+        jira_url = os.getenv('JIRA_URL', 'https://enomix.atlassian.net')
+        return {
+            "estimations": [estimation.__dict__ for estimation in paginated_estimations],
+            "jira_url": jira_url,
+            "pagination": {
+                "current_page": page,
+                "page_size": page_size,
+                "total_count": total_count,
+                "total_pages": total_pages,
+                "has_previous": page > 1,
+                "has_next": page < total_pages
+            }
+        }
+    except Exception as e:
+        logger.error(f"❌ 공수 산정 목록 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# 카테고리 관리 API
+@app.post("/effort/auto-classify/")
+async def auto_classify_estimations():
+    """미분류 데이터 자동 분류"""
+    try:
+        estimations = effort_manager.get_all_estimations()
+        
+        # 미분류 데이터 필터링 (카테고리가 없는 경우)
+        unclassified = [
+            est for est in estimations 
+            if not est.major_category or not est.minor_category or not est.sub_category
+        ]
+        
+        logger.info(f"미분류 데이터: {len(unclassified)}개")
+        
+        # 자동 분류 실행
+        classified_count = 0
+        total_confidence = 0
+        
+        # 신뢰도별 카테고리 분류
+        low_confidence = []  # 0.1 ~ 0.3
+        medium_confidence = []  # 0.3 ~ 0.5
+        high_confidence = []  # 0.5 이상
+        
+        for estimation in unclassified:
+            # 제목과 설명을 모두 사용하여 분류
+            classification_text = estimation.title
+            if estimation.notes:
+                classification_text += " " + estimation.notes
+            
+            predicted_category, confidence = auto_classify(classification_text)
+            
+            # confidence를 명시적으로 float로 변환
+            try:
+                conf_float = float(confidence) if confidence is not None else 0.0
+                conf_str = f"{conf_float:.2f}"
+            except Exception as e:
+                logger.error(f"❌ confidence 변환 오류: {e}, confidence={confidence}, type={type(confidence)}")
+                conf_float = 0.0
+                conf_str = "0.00"
+            
+            if predicted_category and conf_float >= 0.5:
+                # 높은 신뢰도: 자동 적용
+                category_parts = predicted_category.split(' > ')
+                if len(category_parts) >= 3:
+                    estimation.major_category = category_parts[0]
+                    estimation.minor_category = category_parts[1]
+                    estimation.sub_category = category_parts[2]
+                    classified_count += 1
+                    total_confidence += conf_float
+                    high_confidence.append((estimation.title, predicted_category, conf_float))
+                    logger.info(f"✅ 자동 분류 (높음): {estimation.title} -> {predicted_category} (신뢰도: {conf_str})")
+            elif predicted_category and conf_float >= 0.3:
+                # 중간 신뢰도: 사용자 확인 후 적용
+                medium_confidence.append((estimation.title, predicted_category, conf_float))
+                logger.info(f"⚠️ 신뢰도 중간: {estimation.title} -> {predicted_category} (신뢰도: {conf_str})")
+            elif predicted_category and conf_float >= 0.1:
+                # 낮은 신뢰도: 제안만
+                low_confidence.append((estimation.title, predicted_category, conf_float))
+                logger.info(f"📝 신뢰도 낮음: {estimation.title} -> {predicted_category} (신뢰도: {conf_str})")
+            else:
+                logger.info(f"❌ 분류 실패: {estimation.title} (신뢰도: {conf_str if conf_float else 'N/A'})")
+        
+        # 평균 신뢰도 계산
+        avg_confidence = total_confidence / classified_count if classified_count > 0 else 0
+        
+        # 변경사항 저장
+        effort_manager.save_data()
+        
+        # 튜플을 딕셔너리로 변환 (JSON 직렬화 가능하도록)
+        def tuple_to_dict(tup_list):
+            return [
+                {
+                    "title": str(tup[0]),
+                    "category": str(tup[1]),
+                    "confidence": round(float(tup[2]), 2)
+                }
+                for tup in tup_list
+            ]
+        
+        return {
+            "message": "자동 분류 완료",
+            "total_unclassified": len(unclassified),
+            "high_confidence_count": len(high_confidence),
+            "medium_confidence_count": len(medium_confidence),
+            "low_confidence_count": len(low_confidence),
+            "classified_count": classified_count,
+            "average_confidence": round(avg_confidence, 2),
+            "high_confidence": tuple_to_dict(high_confidence[:5]),
+            "medium_confidence": tuple_to_dict(medium_confidence[:5]),
+            "low_confidence": tuple_to_dict(low_confidence[:5])
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 자동 분류 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/categories/")
+async def get_categories():
+    """카테고리 구조 조회"""
+    try:
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        return category_manager.get_categories()
+    except Exception as e:
+        logger.error(f"❌ 카테고리 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/categories/major/")
+async def get_major_categories():
+    """대분류 목록 조회"""
+    try:
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        return {"categories": category_manager.get_major_categories()}
+    except Exception as e:
+        logger.error(f"❌ 대분류 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/categories/minor/")
+async def get_minor_categories(major: str):
+    """중분류 목록 조회"""
+    try:
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        return {"categories": category_manager.get_minor_categories(major)}
+    except Exception as e:
+        logger.error(f"❌ 중분류 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/effort/categories/sub/")
+async def get_sub_categories(major: str, minor: str):
+    """소분류 목록 조회"""
+    try:
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        return {"categories": category_manager.get_sub_categories(major, minor)}
+    except Exception as e:
+        logger.error(f"❌ 소분류 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/categories/")
+async def add_category(request: Request):
+    """새 카테고리 추가"""
+    try:
+        data = await request.json()
+        major = data.get("major")
+        minor = data.get("minor")
+        sub = data.get("sub")
+        
+        if not all([major, minor, sub]):
+            return JSONResponse(status_code=400, content={"error": "대분류, 중분류, 소분류가 모두 필요합니다"})
+        
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        category_manager.add_category(major, minor, sub)
+        
+        return {"message": "카테고리가 추가되었습니다"}
+    except Exception as e:
+        logger.error(f"❌ 카테고리 추가 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.put("/effort/categories/")
+async def update_category(request: Request):
+    """카테고리 수정"""
+    try:
+        data = await request.json()
+        old_major = data.get("old_major")
+        old_minor = data.get("old_minor")
+        old_sub = data.get("old_sub")
+        new_major = data.get("new_major")
+        new_minor = data.get("new_minor")
+        new_sub = data.get("new_sub")
+        
+        if not all([old_major, old_minor, old_sub, new_major, new_minor, new_sub]):
+            return JSONResponse(status_code=400, content={"error": "모든 필드가 필요합니다"})
+        
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        category_manager.update_category(old_major, old_minor, old_sub, new_major, new_minor, new_sub)
+        
+        return {"message": "카테고리가 수정되었습니다"}
+    except Exception as e:
+        logger.error(f"❌ 카테고리 수정 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.delete("/effort/categories/")
+async def delete_category(request: Request):
+    """카테고리 삭제"""
+    try:
+        data = await request.json()
+        major = data.get("major")
+        minor = data.get("minor")
+        sub = data.get("sub")
+        
+        if not all([major, minor, sub]):
+            return JSONResponse(status_code=400, content={"error": "대분류, 중분류, 소분류가 모두 필요합니다"})
+        
+        from ..services.effort_estimation import CategoryManager
+        category_manager = CategoryManager()
+        category_manager.delete_category(major, minor, sub)
+        
+        return {"message": "카테고리가 삭제되었습니다"}
+    except Exception as e:
+        logger.error(f"❌ 카테고리 삭제 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.put("/effort/update-category/")
+async def update_effort_category(request: Request):
+    """공수 산정 데이터의 카테고리 수정"""
+    try:
+        data = await request.json()
+        jira_ticket = data.get("jira_ticket")
+        major_category = data.get("major_category")
+        minor_category = data.get("minor_category")
+        sub_category = data.get("sub_category")
+        
+        if not all([jira_ticket, major_category, minor_category, sub_category]):
+            return JSONResponse(status_code=400, content={"error": "모든 필드가 필요합니다"})
+        
+        from ..services.effort_estimation import effort_manager
+        success = effort_manager.update_estimation_category(jira_ticket, major_category, minor_category, sub_category)
+        
+        if success:
+            return {"message": "카테고리가 수정되었습니다"}
+        else:
+            return JSONResponse(status_code=404, content={"error": "해당 티켓을 찾을 수 없습니다"})
+    except Exception as e:
+        logger.error(f"❌ 카테고리 수정 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.delete("/effort/delete/{jira_ticket}")
+async def delete_effort_estimation(jira_ticket: str):
+    """공수 산정 데이터 삭제"""
+    try:
+        from ..services.effort_estimation import effort_manager
+        
+        # 해당 티켓이 존재하는지 확인
+        estimation = effort_manager.get_estimation_by_ticket(jira_ticket)
+        if not estimation:
+            return JSONResponse(status_code=404, content={"error": "해당 티켓을 찾을 수 없습니다"})
+        
+        # 삭제 실행
+        success = effort_manager.delete_estimation(jira_ticket)
+        
+        if success:
+            logger.info(f"✅ 공수 산정 데이터 삭제 완료: {jira_ticket}")
+            return {"message": "데이터가 삭제되었습니다"}
+        else:
+            logger.error(f"❌ 공수 산정 데이터 삭제 실패: {jira_ticket}")
+            return JSONResponse(status_code=500, content={"error": "삭제 중 오류가 발생했습니다"})
+    except Exception as e:
+        logger.error(f"❌ 공수 산정 데이터 삭제 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/sync-epic/")
+async def sync_epic_data(request: Request):
+    """Epic 하위 작업 동기화"""
+    try:
+        # 요청 데이터 로깅
+        logger.info(f"🔄 Epic 동기화 요청 수신 시작")
+        
+        # Content-Type 확인
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"🔄 Content-Type: {content_type}")
+        
+        # FormData 파싱
+        form_data = await request.form()
+        logger.info(f"🔄 FormData keys: {list(form_data.keys())}")
+        
+        epic_key = form_data.get("epic_key")
+        major_category = form_data.get("major_category")
+        minor_category = form_data.get("minor_category")
+        sub_category = form_data.get("sub_category")
+        title_filter = form_data.get("title_filter", "").strip()
+        logger.info(f"🔄 Epic 동기화 요청 수신: epic_key={epic_key}, categories={major_category}/{minor_category}/{sub_category}, title_filter={title_filter}")
+        
+        if not epic_key:
+            logger.error("❌ epic_key 파라미터가 없습니다")
+            return JSONResponse(status_code=422, content={"error": "epic_key 파라미터가 필요합니다"})
+        
+        jira = create_jira_integration()
+        if not jira:
+            logger.error("❌ Jira 설정이 없습니다")
+            return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+        
+        # Epic 하위 작업 조회
+        subtasks_result = jira.test_epic_subtasks(epic_key)
+        if not subtasks_result or not subtasks_result.get("success"):
+            error_msg = subtasks_result.get("error", "알 수 없는 오류") if subtasks_result else "Epic 조회 실패"
+            logger.error(f"❌ Epic 하위 작업 조회 실패: {epic_key} - {error_msg}")
+            return JSONResponse(status_code=404, content={"error": f"Epic '{epic_key}'의 하위 작업을 찾을 수 없습니다: {error_msg}"})
+        
+        # 작업 타입 필터링 (작업만)
+        tasks = subtasks_result.get("subtasks", [])
+        filtered_tasks = [task for task in tasks if task.get("issue_type") == "작업"]
+        
+        logger.info(f"🔄 작업 타입 필터링: 총 {len(tasks)}개 → {len(filtered_tasks)}개")
+        logger.info(f"🔄 실제 타입들: {[task.get('issue_type') for task in tasks[:10]]}")  # 처음 10개만 로깅
+        
+        # 제목 필터링 (선택사항)
+        if title_filter:
+            original_count = len(filtered_tasks)
+            filtered_tasks = [task for task in filtered_tasks if title_filter.lower() in task.get("summary", "").lower()]
+            logger.info(f"🔄 제목 필터링: '{title_filter}' - {original_count}개 → {len(filtered_tasks)}개")
+        
+        logger.info(f"🔄 Epic '{epic_key}' 하위 작업: 총 {len(tasks)}개, 작업 타입 {len(filtered_tasks)}개")
+        
+        if not filtered_tasks:
+            return JSONResponse(status_code=404, content={"error": f"Epic '{epic_key}'에 작업 타입의 하위 작업이 없습니다"})
+        
+        # 각 작업을 공수 산정 데이터로 변환
+        from ..services.effort_estimation import effort_manager
+        
+        added_count = 0
+        updated_count = 0
+        skipped_count = 0
+        
+        for task in filtered_tasks:
+            try:
+                # 기존 데이터 확인
+                existing = effort_manager.get_estimation_by_ticket(task["key"])
+                
+                if existing:
+                    # 기존 데이터 업데이트
+                    effort_manager.update_estimation_category(
+                        task["key"], 
+                        major_category or existing.major_category or "",
+                        minor_category or existing.minor_category or "",
+                        sub_category or existing.sub_category or ""
+                    )
+                    updated_count += 1
+                    logger.info(f"✅ 기존 데이터 업데이트: {task['key']}")
+                else:
+                    # 새 데이터 추가
+                    from ..services.effort_estimation import EffortEstimation
+                    
+                    new_estimation = EffortEstimation(
+                        jira_ticket=task["key"],
+                        title=task["summary"],
+                        story_points=task.get("story_points", 0),
+                        description=task.get("description", ""),
+                        team_member=task.get("assignee", ""),
+                        estimation_reason="Epic 하위 작업 자동 동기화",
+                        major_category=major_category or "",
+                        minor_category=minor_category or "",
+                        sub_category=sub_category or ""
+                    )
+                    
+                    effort_manager.add_estimation(new_estimation)
+                    added_count += 1
+                    logger.info(f"✅ 새 데이터 추가: {task['key']}")
+                    
+            except Exception as e:
+                logger.error(f"❌ 작업 처리 실패 {task['key']}: {str(e)}")
+                skipped_count += 1
+        
+        result = {
+            "success": True,
+            "epic_key": epic_key,
+            "total_tasks": len(filtered_tasks),
+            "added_tasks": added_count,
+            "updated_tasks": updated_count,
+            "skipped_tasks": skipped_count,
+            "jql_used": subtasks_result.get("jql_used", "알 수 없음"),
+            "message": f"Epic '{epic_key}' 하위 작업 동기화 완료"
+        }
+        
+        logger.info(f"✅ Epic 동기화 완료: {result}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Epic 동기화 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ==================== 프롬프트 관리 엔드포인트 ====================
+
+@app.get("/prompts/intent/stats/")
+async def get_intent_prompt_stats():
+    """의도 분류 프롬프트 통계 조회"""
+    try:
+        stats = intent_prompt_manager.get_stats()
+        return stats
+    except Exception as e:
+        logger.error(f"❌ 프롬프트 통계 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/prompts/intent/related/")
+async def add_related_example(example: str = Form(...)):
+    """관련 예시 추가"""
+    try:
+        success = intent_prompt_manager.add_related_example(example)
+        if success:
+            return {"message": f"관련 예시가 추가되었습니다: {example}"}
+        else:
+            return {"message": f"이미 존재하는 예시입니다: {example}"}
+    except Exception as e:
+        logger.error(f"❌ 관련 예시 추가 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/prompts/intent/unrelated/")
+async def add_unrelated_example(example: str = Form(...)):
+    """관련 없는 예시 추가"""
+    try:
+        success = intent_prompt_manager.add_unrelated_example(example)
+        if success:
+            return {"message": f"관련 없는 예시가 추가되었습니다: {example}"}
+        else:
+            return {"message": f"이미 존재하는 예시입니다: {example}"}
+    except Exception as e:
+        logger.error(f"❌ 관련 없는 예시 추가 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.delete("/prompts/intent/related/")
+async def remove_related_example(example: str = Form(...)):
+    """관련 예시 제거"""
+    try:
+        success = intent_prompt_manager.remove_related_example(example)
+        if success:
+            return {"message": f"관련 예시가 제거되었습니다: {example}"}
+        else:
+            return {"message": f"존재하지 않는 예시입니다: {example}"}
+    except Exception as e:
+        logger.error(f"❌ 관련 예시 제거 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.delete("/prompts/intent/unrelated/")
+async def remove_unrelated_example(example: str = Form(...)):
+    """관련 없는 예시 제거"""
+    try:
+        success = intent_prompt_manager.remove_unrelated_example(example)
+        if success:
+            return {"message": f"관련 없는 예시가 제거되었습니다: {example}"}
+        else:
+            return {"message": f"존재하지 않는 예시입니다: {example}"}
+    except Exception as e:
+        logger.error(f"❌ 관련 없는 예시 제거 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ==================== 피드백 수집 엔드포인트 ====================
+
+@app.get("/test/simple")
+async def test_simple():
+    """간단한 테스트 엔드포인트"""
+    return {"message": "테스트 성공", "status": "ok"}
+
+@app.get("/test/epic-list")
+async def test_epic_list():
+    """사용 가능한 Epic 목록 조회"""
+    try:
+        jira = create_jira_integration()
+        
+        # JQL로 Epic 타입 이슈 조회 (API v3) - 페이징 처리로 더 많은 Epic 조회
+        search_url = f"{jira.jira_url}/rest/api/3/search/jql"
+        
+        all_epics = []
+        start_at = 0
+        max_results = 100
+        
+        # 먼저 특정 프로젝트의 Epic 조회 시도
+        project_epics = []
+        try:
+            params_project = {
+                'jql': 'project = ENOMIX AND issuetype = Epic ORDER BY created ASC',
+                'maxResults': 500,  # 200에서 500으로 증가
+                'fields': 'key,summary,status,resolution,created'
+            }
+            response_project = jira.session.get(search_url, params=params_project)
+            if response_project.status_code == 200:
+                project_results = response_project.json()
+                project_epics = project_results.get('issues', [])
+                logger.info(f"🔍 프로젝트별 Epic 조회: {len(project_epics)}개")
+        except Exception as e:
+            logger.warning(f"⚠️ 프로젝트별 Epic 조회 실패: {e}")
+        
+        # 프로젝트별 조회가 성공하면 그것을 사용, 아니면 전체 조회
+        if project_epics:
+            all_epics = project_epics
+        else:
+            while True:
+                # 날짜 조건 없이 모든 Epic 조회 (더 넓은 범위)
+                params = {
+                    'jql': 'issuetype = Epic ORDER BY created ASC',  # 오래된 것부터 조회
+                    'maxResults': max_results,
+                    'startAt': start_at,
+                    'fields': 'key,summary,status,resolution,created'
+                }
+                
+                response = jira.session.get(search_url, params=params)
+                
+                if response.status_code != 200:
+                    break
+                    
+                results = response.json()
+                issues = results.get('issues', [])
+                
+                if not issues:
+                    break
+                    
+                all_epics.extend(issues)
+                
+                # 더 이상 가져올 데이터가 없으면 중단
+                if len(issues) < max_results:
+                    break
+                    
+                start_at += max_results
+                
+                # 최대 500개까지만 조회 (무한 루프 방지)
+                if start_at >= 500:
+                    break
+        
+        # 결과를 response 형태로 변환
+        response_data = {
+            'issues': all_epics,
+            'total': len(all_epics)
+        }
+        
+        # Epic 목록 처리
+        epics = []
+        for issue in response_data.get('issues', []):
+            epics.append({
+                'key': issue['key'],
+                'summary': issue['fields']['summary'],
+                'status': issue['fields']['status']['name'],
+                'created': issue['fields'].get('created', 'N/A')
+            })
+        
+        # ENOMIX-7338이 목록에 있는지 확인
+        target_epic = next((epic for epic in epics if epic['key'] == 'ENOMIX-7338'), None)
+        if target_epic:
+            logger.info(f"✅ ENOMIX-7338 발견: {target_epic}")
+        else:
+            logger.warning(f"⚠️ ENOMIX-7338이 목록에 없음. 총 {len(epics)}개 Epic 조회됨")
+            
+            # ENOMIX-7338을 직접 검색해보기
+            try:
+                params_direct = {
+                    'jql': 'key = ENOMIX-7338',
+                    'maxResults': 1,
+                    'fields': 'key,summary,status,issuetype,assignee,created'
+                }
+                response_direct = jira.session.get(search_url, params=params_direct)
+                if response_direct.status_code == 200:
+                    direct_results = response_direct.json()
+                    if direct_results.get('total', 0) > 0:
+                        direct_epic = direct_results['issues'][0]
+                        logger.info(f"🔍 ENOMIX-7338 직접 검색 성공: {direct_epic['key']} - {direct_epic['fields']['summary']}")
+                    else:
+                        logger.warning(f"🔍 ENOMIX-7338 직접 검색 결과 없음")
+                else:
+                    logger.warning(f"🔍 ENOMIX-7338 직접 검색 실패: {response_direct.status_code}")
+            except Exception as e:
+                logger.warning(f"🔍 ENOMIX-7338 직접 검색 오류: {e}")
+            
+        return {
+            "success": True,
+            "epics": epics,
+            "total": len(epics),
+            "test_urls": [f"/test/epic-info/{epic['key']}" for epic in epics[:3]]  # 테스트용 URL 추가
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Epic 목록 조회 중 오류 발생"
+        }
+
+@app.get("/test/jira-connection")
+async def test_jira_connection():
+    """Jira 연결 테스트"""
+    try:
+        jira = create_jira_integration()
+        connection_result = jira.test_connection()
+        
+        return {
+            "success": connection_result,
+            "message": "Jira 연결 성공" if connection_result else "Jira 연결 실패",
+            "jira_url": jira.jira_url if hasattr(jira, 'jira_url') else 'N/A',
+            "username": jira.username if hasattr(jira, 'username') else 'N/A'
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Jira 연결 테스트 중 오류 발생"
+        }
+
+@app.get("/test/epic-subtasks/{epic_key}")
+async def test_epic_subtasks(epic_key: str):
+    """Epic 하위 Task 조회 테스트"""
+    try:
+        logger.info(f"🔍 Epic 하위 Task 조회 시도: {epic_key}")
+        
+        jira = create_jira_integration()
+        result = jira.test_epic_subtasks(epic_key)
+        
+        # 디버깅을 위한 추가 정보
+        result["debug_info"] = {
+            "epic_key": epic_key,
+            "timestamp": str(datetime.now()),
+            "jira_url": jira.jira_url if jira else "N/A"
+        }
+        
+        return result
+    except Exception as e:
+        logger.error(f"❌ Epic 하위 Task 조회 API 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e), "details": "서버 내부 오류가 발생했습니다."})
+
+@app.get("/test/jql/{jql_query}")
+async def test_jql_query(jql_query: str):
+    """JQL 쿼리 직접 테스트"""
+    try:
+        jira = create_jira_integration()
+        if not jira:
+            return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+        
+        search_url = f"{jira.jira_url}/rest/api/3/search/jql"
+        
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        
+        params = {
+            'jql': jql_query,
+            'maxResults': 10,
+            'fields': 'key,summary,status,issuetype,assignee',
+            'expand': 'changelog'
+        }
+        
+        logger.info(f"🔍 JQL 테스트 요청 URL: {search_url}")
+        logger.info(f"🔍 JQL 테스트 요청 파라미터: {params}")
+        logger.info(f"🔍 JQL 테스트 요청 헤더: {headers}")
+        
+        response = jira.session.get(search_url, params=params, headers=headers)
+        
+        return {
+            "success": response.status_code == 200,
+            "status_code": response.status_code,
+            "jql_query": jql_query,
+            "response": response.json() if response.status_code == 200 else response.text
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/test/issue-id/{issue_id}")
+async def test_issue_id(issue_id: str):
+    """이슈 ID로 조회 테스트"""
+    try:
+        jira = create_jira_integration()
+        if not jira:
+            return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+        
+        search_url = f"{jira.jira_url}/rest/api/3/search/jql"
+        
+        headers = {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        
+        params = {
+            'jql': f'id = {issue_id}',
+            'maxResults': 10,
+            'fields': 'key,summary,status,issuetype,assignee,id',
+            'expand': 'changelog'
+        }
+        
+        logger.info(f"🔍 이슈 ID 테스트 요청 URL: {search_url}")
+        logger.info(f"🔍 이슈 ID 테스트 요청 파라미터: {params}")
+        logger.info(f"🔍 이슈 ID 테스트 요청 헤더: {headers}")
+        
+        response = jira.session.get(search_url, params=params, headers=headers)
+        
+        return {
+            "success": response.status_code == 200,
+            "status_code": response.status_code,
+            "issue_id": issue_id,
+            "response": response.json() if response.status_code == 200 else response.text
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/test/permissions")
+async def test_permissions():
+    """현재 계정의 권한 확인"""
+    try:
+        jira = create_jira_integration()
+        if not jira:
+            return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+        
+        # 현재 사용자 정보 조회
+        user_url = f"{jira.jira_url}/rest/api/3/myself"
+        user_response = jira.session.get(user_url)
+        
+        # 프로젝트 목록 조회
+        projects_url = f"{jira.jira_url}/rest/api/3/project"
+        projects_response = jira.session.get(projects_url)
+        
+        # ENOMIX 프로젝트 상세 정보 조회
+        enomix_url = f"{jira.jira_url}/rest/api/3/project/ENOMIX"
+        enomix_response = jira.session.get(enomix_url)
+        
+        return {
+            "success": True,
+            "user_info": user_response.json() if user_response.status_code == 200 else f"사용자 정보 조회 실패: {user_response.status_code}",
+            "projects": projects_response.json() if projects_response.status_code == 200 else f"프로젝트 목록 조회 실패: {projects_response.status_code}",
+            "enomix_project": enomix_response.json() if enomix_response.status_code == 200 else f"ENOMIX 프로젝트 조회 실패: {enomix_response.status_code}",
+            "user_status": user_response.status_code,
+            "projects_status": projects_response.status_code,
+            "enomix_status": enomix_response.status_code
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/test/epic-info/{epic_key}")
+async def test_epic_info(epic_key: str):
+    """Epic 기본 정보 조회 테스트"""
+    try:
+        logger.info(f"🔍 Epic 정보 조회 시도: {epic_key}")
+        
+        # Jira 연결 테스트
+        jira = create_jira_integration()
+        connection_result = jira.test_connection()
+        logger.info(f"Jira 연결 결과: {connection_result}")
+        
+        if not connection_result:
+            return {
+                "success": False,
+                "error": "Jira 연결 실패",
+                "details": "Jira 서버에 연결할 수 없습니다. 인증 정보를 확인해주세요."
+            }
+        
+        # Epic 정보 조회
+        epic_info = jira.test_epic_basic_info(epic_key)
+        logger.info(f"Epic 정보 조회 결과: {epic_info}")
+        logger.info(f"Epic 정보 타입: {type(epic_info)}")
+        
+        if epic_info is None:
+            return {
+                "success": False,
+                "error": "Epic 정보 조회 실패",
+                "details": f"Epic '{epic_key}'를 찾을 수 없습니다. Epic 키를 확인해주세요.",
+                "debug_info": "epic_info가 None으로 반환됨"
+            }
+        
+        if not isinstance(epic_info, dict):
+            return {
+                "success": False,
+                "error": "Epic 정보 형식 오류",
+                "details": f"예상된 형식이 아닙니다. 받은 타입: {type(epic_info)}",
+                "debug_info": str(epic_info)
+            }
+        
+        if 'fields' not in epic_info:
+            return {
+                "success": False,
+                "error": "Epic 정보 필드 누락",
+                "details": "Epic 정보에 'fields' 필드가 없습니다.",
+                "debug_info": str(epic_info)
+            }
+        
+        # Epic 정보를 안전하게 처리
+        try:
+            fields = epic_info.get('fields', {}) if epic_info else {}
+            epic_title = 'N/A'
+            issue_type = 'N/A'
+            status = 'N/A'
+            assignee = 'N/A'
+            
+            if fields:
+                epic_title = fields.get('summary', 'N/A') if fields.get('summary') is not None else 'N/A'
+                
+                issue_type_obj = fields.get('issuetype')
+                if issue_type_obj and isinstance(issue_type_obj, dict):
+                    issue_type = issue_type_obj.get('name', 'N/A')
+                
+                status_obj = fields.get('status')
+                if status_obj and isinstance(status_obj, dict):
+                    status = status_obj.get('name', 'N/A')
+                
+                assignee_obj = fields.get('assignee')
+                if assignee_obj and isinstance(assignee_obj, dict):
+                    assignee = assignee_obj.get('displayName', 'N/A')
+            
+            return {
+                "success": True,
+                "epic_key": epic_key,
+                "epic_title": epic_title,
+                "issue_type": issue_type,
+                "status": status,
+                "assignee": assignee
+            }
+        except Exception as e:
+            logger.error(f"❌ Epic 정보 처리 오류: {str(e)}")
+            return {
+                "success": False,
+                "error": "Epic 정보 처리 오류",
+                "details": f"Epic 정보를 처리하는 중 오류가 발생했습니다: {str(e)}",
+                "debug_info": str(epic_info)
+            }
+    except Exception as e:
+        logger.error(f"❌ Epic 정보 조회 API 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e), "details": "서버 내부 오류가 발생했습니다."})
+
+@app.post("/feedback/")
+async def collect_feedback(request: Request):
+    """사용자 피드백 수집"""
+    try:
+        data = await request.json()
+        question = data.get("question")
+        feedback_type = data.get("feedback_type")
+        timestamp = data.get("timestamp")
+        
+        logger.info(f"📝 피드백 수신: {feedback_type} - '{question}'")
+        
+        # 피드백에 따라 프롬프트 업데이트
+        if feedback_type == "helpful":
+            # 도움이 된 질문 → RELATED 예시에 추가
+            success = intent_prompt_manager.add_related_example(question)
+            if success:
+                logger.info(f"✅ RELATED 예시 추가: '{question}'")
+            else:
+                logger.info(f"ℹ️ 이미 존재하는 RELATED 예시: '{question}'")
+                
+        elif feedback_type == "not-helpful":
+            # 도움이 안된 질문 → UNRELATED 예시에 추가
+            success = intent_prompt_manager.add_unrelated_example(question)
+            if success:
+                logger.info(f"✅ UNRELATED 예시 추가: '{question}'")
+            else:
+                logger.info(f"ℹ️ 이미 존재하는 UNRELATED 예시: '{question}'")
+                
+        elif feedback_type == "wrong-classification":
+            # 잘못 분류된 질문 → 반대 카테고리로 이동
+            related_examples = intent_prompt_manager.get_related_examples()
+            unrelated_examples = intent_prompt_manager.get_unrelated_examples()
+            
+            if question in related_examples:
+                # RELATED에서 UNRELATED로 이동
+                intent_prompt_manager.remove_related_example(question)
+                intent_prompt_manager.add_unrelated_example(question)
+                logger.info(f"🔄 '{question}' RELATED → UNRELATED 이동")
+            elif question in unrelated_examples:
+                # UNRELATED에서 RELATED로 이동
+                intent_prompt_manager.remove_unrelated_example(question)
+                intent_prompt_manager.add_related_example(question)
+                logger.info(f"🔄 '{question}' UNRELATED → RELATED 이동")
+            else:
+                # 새로운 질문이면 UNRELATED에 추가
+                intent_prompt_manager.add_unrelated_example(question)
+                logger.info(f"✅ 새로운 UNRELATED 예시 추가: '{question}'")
+        
+        return {"message": "피드백이 성공적으로 처리되었습니다"}
+        
+    except Exception as e:
+        logger.error(f"❌ 피드백 처리 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/categories/migrate/")
+async def migrate_categories(request: Request):
+    """카테고리 변경 시 기존 데이터 마이그레이션"""
+    try:
+        data = await request.json()
+        old_category = data.get("old_category")  # "대분류 > 중분류 > 소분류"
+        new_category = data.get("new_category")  # "대분류 > 중분류 > 소분류"
+        
+        if not old_category or not new_category:
+            return JSONResponse(status_code=400, content={"error": "old_category와 new_category가 필요합니다"})
+        
+        # 카테고리 파싱
+        old_parts = old_category.split(' > ')
+        new_parts = new_category.split(' > ')
+        
+        if len(old_parts) != 3 or len(new_parts) != 3:
+            return JSONResponse(status_code=400, content={"error": "카테고리는 대분류 > 중분류 > 소분류 형식이어야 합니다"})
+        
+        old_major, old_minor, old_sub = old_parts
+        new_major, new_minor, new_sub = new_parts
+        
+        # 해당 카테고리의 모든 데이터 업데이트
+        estimations = effort_manager.get_all_estimations()
+        updated_count = 0
+        
+        for estimation in estimations:
+            if (estimation.major_category == old_major and 
+                estimation.minor_category == old_minor and 
+                estimation.sub_category == old_sub):
+                
+                estimation.major_category = new_major
+                estimation.minor_category = new_minor
+                estimation.sub_category = new_sub
+                updated_count += 1
+        
+        # 변경사항 저장
+        effort_manager.save_data()
+        
+        return {
+            "message": f"{updated_count}개 데이터가 마이그레이션되었습니다",
+            "updated_count": updated_count
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 카테고리 마이그레이션 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/categories/upload-excel")
+async def upload_categories_excel(file: UploadFile = File(...)):
+    """엑셀 파일로 카테고리 업데이트"""
+    try:
+        # 엑셀 파일 읽기 (openpyxl로 병합된 셀 처리)
+        contents = await file.read()
+        from openpyxl import load_workbook
+        
+        # openpyxl로 워크북 로드
+        wb = load_workbook(io.BytesIO(contents))
+        ws = wb.active
+        
+        # JSON 구조로 변환
+        categories = {}
+        
+        # 병합된 셀 정보 수집
+        merged_ranges = list(ws.merged_cells.ranges)
+        
+        for row in ws.iter_rows(min_row=2, values_only=True):  # 헤더 제외
+            if not any(row):  # 빈 행 건너뛰기
+                continue
+                
+            # 병합된 셀 값 처리
+            major = str(row[0]).strip() if row[0] and str(row[0]).strip() != 'None' else ""
+            minor = str(row[1]).strip() if row[1] and str(row[1]).strip() != 'None' else ""
+            sub = str(row[2]).strip() if row[2] and str(row[2]).strip() != 'None' else ""
+            
+            # 병합된 셀에서 값이 비어있으면 이전 행의 값 사용
+            if not major and categories:
+                # 이전 대분류 값 사용
+                major = list(categories.keys())[-1] if categories else ""
+            
+            if not minor and major in categories and categories[major]:
+                # 이전 중분류 값 사용
+                minor = list(categories[major].keys())[-1] if categories[major] else ""
+            
+            if major and major != 'nan':
+                if major not in categories:
+                    categories[major] = {}
+                if minor and minor != 'nan':
+                    if minor not in categories[major]:
+                        categories[major][minor] = []
+                    if sub and sub != 'nan':
+                        categories[major][minor].append(sub)
+        
+        # 기존 파일 백업
+        categories_file = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'docs', 'categories.json')
+        backup_file = f"{categories_file}.backup"
+        if os.path.exists(categories_file):
+            shutil.copy2(categories_file, backup_file)
+        
+        # 새 카테고리 저장
+        with open(categories_file, 'w', encoding='utf-8') as f:
+            json.dump(categories, f, ensure_ascii=False, indent=2)
+        
+        return {"success": True, "message": "엑셀 파일로 카테고리 업데이트 완료", "categories": categories}
+    except Exception as e:
+        logger.error(f"❌ 엑셀 파일 업로드 오류: {str(e)}")
+        return {"success": False, "error": str(e)}
+
+@app.get("/effort/categories/download-excel")
+async def download_categories_excel():
+    """현재 카테고리를 엑셀 파일로 다운로드"""
+    try:
+        # 현재 카테고리 로드
+        categories_file = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'docs', 'categories.json')
+        
+        if not os.path.exists(categories_file):
+            return JSONResponse(status_code=404, content={"error": "카테고리 파일을 찾을 수 없습니다"})
+        
+        with open(categories_file, 'r', encoding='utf-8') as f:
+            categories = json.load(f)
+        
+        # openpyxl로 워크북 생성
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "카테고리"
+        
+        # 헤더 설정
+        headers = ['대분류', '중분류', '소분류']
+        for col, header in enumerate(headers, 1):
+            ws.cell(row=1, column=col, value=header)
+        
+        # 데이터 입력 및 병합 처리
+        current_row = 2
+        major_start_row = 2
+        minor_start_row = 2
+        
+        for major, minor_categories in categories.items():
+            major_start_row = current_row
+            
+            for minor, sub_categories in minor_categories.items():
+                minor_start_row = current_row
+                
+                for sub in sub_categories:
+                    ws.cell(row=current_row, column=1, value=major)
+                    ws.cell(row=current_row, column=2, value=minor)
+                    ws.cell(row=current_row, column=3, value=sub)
+                    current_row += 1
+                
+                # 중분류 병합 (소분류가 여러 개인 경우)
+                if current_row - minor_start_row > 1:
+                    ws.merge_cells(f'B{minor_start_row}:B{current_row - 1}')
+            
+            # 대분류 병합 (중분류가 여러 개인 경우)
+            if current_row - major_start_row > 1:
+                ws.merge_cells(f'A{major_start_row}:A{current_row - 1}')
+        
+        # 스타일 적용
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        
+        # 모든 셀에 테두리 적용
+        for row in ws.iter_rows():
+            for cell in row:
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # 컬럼 너비 자동 조정
+        for column in ws.columns:
+            max_length = 0
+            column_letter = get_column_letter(column[0].column)
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+        
+        # 메모리에서 파일 생성
+        from io import BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        # 파일명 생성 (현재 날짜/시간 포함)
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"categories_{timestamp}.xlsx"
+        
+        # 임시 파일로 저장 후 FileResponse 반환
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp_file:
+            tmp_file.write(output.getvalue())
+            tmp_file_path = tmp_file.name
+        
+        return FileResponse(
+            path=tmp_file_path,
+            filename=filename,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ 엑셀 파일 다운로드 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/feedback/")
+async def save_positive_feedback(request: Request):
+    """피드백 데이터 저장 (긍정/부정 모두 지원)"""
+    try:
+        data = await request.json()
+        question = data.get("question", "")
+        answer = data.get("answer", "")
+        sources = data.get("sources", [])
+        feedback_type = data.get("feedback_type", "positive")
+        user = data.get("user", "web")  # 웹에서 온 피드백은 "web"으로 표시
+        
+        logger.info(f"💾 피드백 저장 요청: {feedback_type} - {question[:50]}...")
+        
+        # 피드백 데이터 구성
+        feedback_data = {
+            "question": question,
+            "answer": answer,
+            "sources": sources,
+            "timestamp": datetime.now().isoformat(),
+            "feedback_type": feedback_type,
+            "source": "web",  # 웹에서 온 피드백
+            "user": user
+        }
+        
+        # 피드백 저장 (긍정/부정 모두 저장)
+        result = save_feedback_to_file(feedback_data)
+        
+        if result.get("saved"):
+            feedback_count = result.get("feedback_count", 1)
+            is_new = result.get("is_new", True)
+            
+            if is_new:
+                logger.info(f"✅ 피드백 저장 완료 (새로운 세트): {feedback_type} - {question[:30]}...")
+            else:
+                logger.info(f"📊 피드백 카운트 증가: {feedback_type} - {question[:30]}... (총 {feedback_count}회)")
+            
+            return {
+                "status": "success",
+                "message": "피드백이 저장되었습니다",
+                "feedback_count": feedback_count,
+                "is_new": is_new
+            }
+        else:
+            logger.error(f"❌ 피드백 저장 실패: {feedback_type} - {question[:30]}...")
+            return JSONResponse(
+                status_code=500,
+                content={"error": "피드백 저장에 실패했습니다"}
+            )
+        
+    except Exception as e:
+        logger.error(f"❌ 피드백 저장 오류: {str(e)}")
+        import traceback
+        logger.error(f"❌ 상세 오류: {traceback.format_exc()}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.post("/effort/reindex-json/")
+async def reindex_json_data():
+    """JSON 파일 강제 재인덱싱"""
+    try:
+        json_file_path = os.path.join(DOCS_DIR, "effort_estimations.json")
+        if not os.path.exists(json_file_path):
+            return JSONResponse(status_code=404, content={"error": "effort_estimations.json 파일을 찾을 수 없습니다"})
+        
+        logger.info("🔄 JSON 파일 강제 재인덱싱 시작")
+        result = index_json_data(json_file_path, force=True)
+        
+        if result:
+            logger.info("✅ JSON 파일 재인덱싱 완료")
+            return {"status": "success", "message": "JSON 파일이 성공적으로 재인덱싱되었습니다"}
+        else:
+            logger.error("❌ JSON 파일 재인덱싱 실패")
+            return JSONResponse(status_code=500, content={"error": "JSON 파일 재인덱싱에 실패했습니다"})
+        
+    except Exception as e:
+        logger.error(f"❌ JSON 파일 재인덱싱 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# StaticFiles 마운트 - API 라우트들 뒤에 배치
+app.mount("/effort-management", StaticFiles(directory=os.path.join(STATIC_DIR, "effort-management")), name="effort-management")
+app.mount("/category-management", StaticFiles(directory=os.path.join(STATIC_DIR, "category-management")), name="category-management")

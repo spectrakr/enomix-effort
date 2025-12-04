@@ -1,0 +1,29 @@
+# 최소 설치 버전 (빌드 문제 없는 패키지들만)
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Web scraping and parsing
+beautifulsoup4==4.12.2
+requests==2.31.0
+
+# AI and ML (tiktoken 제외)
+openai>=1.6.1,<2.0.0
+langchain>=0.1.0
+langchain-openai>=0.0.5
+langchain-community>=0.0.20
+chromadb>=0.4.0
+
+# PDF processing
+pymupdf==1.23.8
+
+# Environment and configuration
+python-dotenv==1.0.0
+
+# Slack integration
+slack-sdk==3.23.0
+
+# Jira integration
+requests-oauthlib==1.3.1
+
+# Logging and utilities
+python-multipart==0.0.6
