@@ -49,8 +49,19 @@ logs/
 *.db
 *.sqlite3
 
-# ChromaDB
+# ChromaDB (벡터 DB - 각 환경에서 자동 생성)
 data/chroma_db/
+data/feedback_chroma_db/
+
+# 운영 데이터 (피드백, QA 로깅 - 각 환경에서 독립적으로 생성)
+data/docs/positive_feedback.json
+data/docs/negative_feedback.json
+data/docs/slack_qa_mapping.json
+data/docs/web_qa_mapping.json
+
+# 단, 초기 데이터는 포함 (공유 필요)
+!data/docs/categories.json
+!data/docs/effort_estimations.json
 
 # Temporary files
 *.tmp

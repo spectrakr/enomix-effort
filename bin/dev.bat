@@ -14,9 +14,9 @@ if errorlevel 1 (
 echo 3️⃣ 서버 시작...
 echo.
 echo 🚀 개발 서버가 시작됩니다.
-echo 📍 URL: http://localhost:7070
+echo 📍 URL: http://localhost:9010
 echo 🔄 자동 리로드 활성화
 echo ⏹️  종료하려면 Ctrl+C를 누르세요
 echo ----------------------------------------
 
-uvicorn backend.main.main:app --host 0.0.0.0 --port 7070 --reload
+uvicorn backend.main.main:app --host 0.0.0.0 --port 9010 --reload
