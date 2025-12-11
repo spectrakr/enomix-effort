@@ -218,7 +218,7 @@ async def handle_slack_message(text: str, channel: str, thread_ts: str, message_
         post_slack_reply(channel, thread_ts, "❌ 오류가 발생했습니다. 다시 시도해주세요.")
 
 def handle_slack_reaction(event: dict):
-    """슬랙 이모지 리액션 처리 (피드백 수집)"""
+    """슬랙 이모지 리액션 처리 (피드백 수집) - 봇 메시지만 처리"""
     try:
         reaction = event.get("reaction", "")
         item = event.get("item", {})
@@ -227,7 +227,6 @@ def handle_slack_reaction(event: dict):
         channel = item.get("channel", "")
         
         logger.info(f"👍 이모지 리액션 수신: reaction='{reaction}' on message {item_ts} by {user}")
-        logger.info(f"📋 전체 이벤트 데이터: {json.dumps(event, ensure_ascii=False, indent=2)}")
         
         # 이모지 타입 확인 (더 많은 형식 지원)
         # 슬랙에서 실제로 전달되는 reaction 값은 이모지 이름 (예: "thumbsup", "+1")
@@ -239,18 +238,13 @@ def handle_slack_reaction(event: dict):
         
         if reaction_normalized not in [e.lower() for e in positive_emojis + negative_emojis]:
             logger.info(f"ℹ️ 피드백 관련 이모지가 아님: '{reaction}' (정규화: '{reaction_normalized}')")
-            logger.info(f"💡 지원하는 이모지: {positive_emojis + negative_emojis}")
             return
         
-        # 질문-답변 매핑에서 찾기
+        # 질문-답변 매핑에서 찾기 (봇이 보낸 메시지만 매핑에 있음)
         qa_data = _slack_qa_mapping.get(item_ts)
         if not qa_data:
-            logger.warning(f"⚠️ 메시지 {item_ts}에 대한 QA 매핑을 찾을 수 없음")
-            logger.warning(f"📋 현재 매핑된 메시지 수: {len(_slack_qa_mapping)}")
-            logger.warning(f"📋 매핑 키 목록: {list(_slack_qa_mapping.keys())[:5]}...")
-            # 매핑이 없어도 사용자에게 알림
-            if channel:
-                post_slack_reply(channel, None, "⚠️ 이 메시지에 대한 피드백을 처리할 수 없습니다. (매핑 정보 없음)")
+            # 매핑이 없으면 봇 메시지가 아니므로 조용히 무시
+            logger.info(f"ℹ️ 메시지 {item_ts}는 봇 메시지가 아니거나 피드백 대상이 아닙니다. (무시)")
             return
         
         question = qa_data.get("question", "")
