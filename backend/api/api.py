@@ -1326,38 +1326,33 @@ async def update_effort_category(request: Request):
 
 @app.delete("/effort/delete/{jira_ticket}")
 async def delete_effort_estimation(jira_ticket: str):
-    """공수 산정 데이터 삭제 (비활성화됨 - 데이터 보호)"""
-    # 데이터 보호를 위해 삭제 기능 비활성화
-    logger.warning(f"⚠️ 삭제 시도 차단: {jira_ticket} (삭제 기능 비활성화됨)")
-    return JSONResponse(
-        status_code=403, 
-        content={
-            "error": "데이터 보호를 위해 삭제 기능이 비활성화되었습니다",
-            "message": "잘못된 데이터는 수정 기능을 사용하거나 관리자에게 문의하세요"
-        }
-    )
-    
-    # 원본 코드 (필요시 주석 해제)
-    # try:
-    #     from ..services.effort_estimation import effort_manager
-    #     
-    #     # 해당 티켓이 존재하는지 확인
-    #     estimation = effort_manager.get_estimation_by_ticket(jira_ticket)
-    #     if not estimation:
-    #         return JSONResponse(status_code=404, content={"error": "해당 티켓을 찾을 수 없습니다"})
-    #     
-    #     # 삭제 실행
-    #     success = effort_manager.delete_estimation(jira_ticket)
-    #     
-    #     if success:
-    #         logger.info(f"✅ 공수 산정 데이터 삭제 완료: {jira_ticket}")
-    #         return {"message": "데이터가 삭제되었습니다"}
-    #     else:
-    #         logger.error(f"❌ 공수 산정 데이터 삭제 실패: {jira_ticket}")
-    #         return JSONResponse(status_code=500, content={"error": "삭제 중 오류가 발생했습니다"})
-    # except Exception as e:
-    #     logger.error(f"❌ 공수 산정 데이터 삭제 오류: {str(e)}")
-    #     return JSONResponse(status_code=500, content={"error": str(e)})
+    """공수 산정 데이터 삭제"""
+    try:
+        from ..services.effort_estimation import effort_manager
+        
+        # 해당 티켓이 존재하는지 확인
+        estimation = effort_manager.get_estimation_by_ticket(jira_ticket)
+        if not estimation:
+            logger.warning(f"⚠️ 삭제 시도 - 티켓 없음: {jira_ticket}")
+            return JSONResponse(status_code=404, content={"error": "해당 티켓을 찾을 수 없습니다"})
+        
+        # 삭제 전 로그 (추적용)
+        logger.warning(f"🗑️ 데이터 삭제 시도: {jira_ticket} (제목: {estimation.title}, Story Points: {estimation.story_points})")
+        
+        # 삭제 실행
+        success = effort_manager.delete_estimation(jira_ticket)
+        
+        if success:
+            logger.info(f"✅ 공수 산정 데이터 삭제 완료: {jira_ticket}")
+            return {"success": True, "message": f"'{jira_ticket}' 데이터가 삭제되었습니다"}
+        else:
+            logger.error(f"❌ 공수 산정 데이터 삭제 실패: {jira_ticket}")
+            return JSONResponse(status_code=500, content={"error": "삭제 중 오류가 발생했습니다"})
+    except Exception as e:
+        logger.error(f"❌ 공수 산정 데이터 삭제 오류: {str(e)}")
+        import traceback
+        logger.error(f"❌ 상세 에러: {traceback.format_exc()}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/effort/sync-epic/")
 async def sync_epic_data(request: Request):
@@ -1442,44 +1437,39 @@ async def sync_epic_data(request: Request):
                 # 기존 데이터 확인
                 existing = effort_manager.get_estimation_by_ticket(task["key"])
                 
+                # 새 데이터 또는 업데이트할 데이터 생성
+                from ..services.effort_estimation import EffortEstimation
+                
+                # Story Points 반올림 (부동소수점 오차 제거)
+                story_points = round(task.get("story_points", 0), 2)
+                story_points_original = task.get("story_points_original")
+                if story_points_original is not None:
+                    story_points_original = round(story_points_original, 2)
+                
+                estimation = EffortEstimation(
+                    jira_ticket=task["key"],
+                    title=task["summary"],
+                    story_points=story_points,
+                    description=task.get("description", None),  # description 포함
+                    comments=None,  # comments만 제외
+                    team_member=task.get("assignee", ""),
+                    estimation_reason="Epic 하위 작업 자동 동기화",
+                    major_category=major_category or (existing.major_category if existing else ""),
+                    minor_category=minor_category or (existing.minor_category if existing else ""),
+                    sub_category=sub_category or (existing.sub_category if existing else ""),
+                    epic_key=epic_key,
+                    epic_name=epic_name,
+                    story_points_original=story_points_original,
+                    story_points_unit=task.get("story_points_unit", "M/D")
+                )
+                
+                # add_estimation은 이미 중복 체크 및 업데이트 로직을 가지고 있음
+                effort_manager.add_estimation(estimation)
+                
                 if existing:
-                    # 기존 데이터 업데이트 (카테고리)
-                    effort_manager.update_estimation_category(
-                        task["key"], 
-                        major_category or existing.major_category or "",
-                        minor_category or existing.minor_category or "",
-                        sub_category or existing.sub_category or ""
-                    )
-                    # Epic 정보 업데이트
-                    effort_manager.update_estimation_epic(
-                        task["key"],
-                        epic_key,
-                        epic_name
-                    )
                     updated_count += 1
                     logger.info(f"✅ 기존 데이터 업데이트: {task['key']} (Epic: {epic_key})")
                 else:
-                    # 새 데이터 추가 (description 포함, comments만 제외)
-                    from ..services.effort_estimation import EffortEstimation
-                    
-                    new_estimation = EffortEstimation(
-                        jira_ticket=task["key"],
-                        title=task["summary"],
-                        story_points=task.get("story_points", 0),
-                        description=task.get("description", None),  # description 포함
-                        comments=None,  # comments만 제외
-                        team_member=task.get("assignee", ""),
-                        estimation_reason="Epic 하위 작업 자동 동기화",
-                        major_category=major_category or "",
-                        minor_category=minor_category or "",
-                        sub_category=sub_category or "",
-                        epic_key=epic_key,
-                        epic_name=epic_name,
-                        story_points_original=task.get("story_points_original"),
-                        story_points_unit=task.get("story_points_unit", "M/D")
-                    )
-                    
-                    effort_manager.add_estimation(new_estimation)
                     added_count += 1
                     logger.info(f"✅ 새 데이터 추가: {task['key']} (Epic: {epic_key})")
                     

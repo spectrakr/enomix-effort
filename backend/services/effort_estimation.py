@@ -261,19 +261,37 @@ class EffortEstimationManager:
     def save_data(self):
         """공수 산정 데이터 저장"""
         try:
+            logger.info(f"💾 데이터 저장 시작: {len(self.estimations)}개 항목")
             data = [asdict(estimation) for estimation in self.estimations]
+            
+            # 파일 경로 확인
+            logger.info(f"📁 저장 경로: {self.data_file}")
+            
+            # 파일 쓰기
             with open(self.data_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.info(f"✅ 공수 산정 데이터 저장 완료: {len(self.estimations)}개")
+            
+            # 저장 후 파일 크기 확인
+            file_size = os.path.getsize(self.data_file)
+            file_size_kb = file_size / 1024
+            
+            logger.info(f"✅ 공수 산정 데이터 저장 완료: {len(self.estimations)}개 ({file_size_kb:.1f}KB)")
             return True
         except Exception as e:
             logger.error(f"❌ 공수 산정 데이터 저장 실패: {str(e)}")
+            import traceback
+            logger.error(f"❌ 상세 에러: {traceback.format_exc()}")
             return False
     
     def add_estimation(self, estimation: EffortEstimation) -> bool:
         """새로운 공수 산정 데이터 추가 (중복 체크 및 업데이트)"""
         try:
-            logger.info(f"🔄 공수 산정 데이터 추가 시도: {estimation}")
+            # Story Points 반올림 강제 (부동소수점 오차 제거)
+            estimation.story_points = round(estimation.story_points, 2) if estimation.story_points else 0
+            if estimation.story_points_original is not None:
+                estimation.story_points_original = round(estimation.story_points_original, 2)
+            
+            logger.info(f"🔄 공수 산정 데이터 추가 시도: {estimation.jira_ticket} (story_points={estimation.story_points})")
             
             # Jira 티켓이 있는 경우 중복 체크
             if estimation.jira_ticket:
@@ -285,8 +303,42 @@ class EffortEstimationManager:
                 
                 if existing_index is not None:
                     # 기존 데이터 업데이트 (카테고리 정보 보존)
-                    logger.info(f"🔄 기존 데이터 업데이트: {estimation.jira_ticket}")
                     existing_data = self.estimations[existing_index]
+                    
+                    # 변경사항 체크
+                    has_changes = False
+                    
+                    # Story Points 변경 체크
+                    if existing_data.story_points != estimation.story_points:
+                        logger.info(f"   💰 Story Points 변경: {existing_data.story_points} → {estimation.story_points}")
+                        has_changes = True
+                    
+                    if existing_data.story_points_original != estimation.story_points_original or \
+                       existing_data.story_points_unit != estimation.story_points_unit:
+                        logger.info(f"   📊 원본 공수 변경: {existing_data.story_points_original} {existing_data.story_points_unit} → {estimation.story_points_original} {estimation.story_points_unit}")
+                        has_changes = True
+                    
+                    # 제목 변경 체크
+                    if existing_data.title != estimation.title:
+                        logger.info(f"   📝 제목 변경")
+                        has_changes = True
+                    
+                    # 담당자 변경 체크
+                    if existing_data.team_member != estimation.team_member:
+                        logger.info(f"   👤 담당자 변경: {existing_data.team_member} → {estimation.team_member}")
+                        has_changes = True
+                    
+                    # Epic 정보 변경 체크
+                    if existing_data.epic_key != estimation.epic_key or existing_data.epic_name != estimation.epic_name:
+                        logger.info(f"   📦 Epic 정보 변경: {existing_data.epic_key} → {estimation.epic_key}")
+                        has_changes = True
+                    
+                    # 변경사항이 없으면 skip
+                    if not has_changes:
+                        logger.info(f"⏭️  변경사항 없음, skip: {estimation.jira_ticket}")
+                        return True
+                    
+                    logger.info(f"🔄 기존 데이터 업데이트: {estimation.jira_ticket}")
                     
                     # 카테고리가 기존에 있으면 보존, 없으면 새 값 사용
                     if existing_data.major_category:

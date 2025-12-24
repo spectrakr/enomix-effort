@@ -8,7 +8,9 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 import logging
-from typing import List, Dict, Any
+import json
+import re
+from typing import List, Dict, Any, Optional
 from langchain_classic.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
@@ -20,6 +22,163 @@ logger = logging.getLogger(__name__)
 
 # Jira URL (Epic 링크 생성용)
 JIRA_BASE_URL = "https://enomix.atlassian.net/browse"
+
+# 고객사 가중치 데이터 로드
+CUSTOMER_WEIGHTS_FILE = os.path.join(DOCS_DIR, "customer_weights.json")
+_customer_weights_cache = None
+
+def load_customer_weights() -> Dict[str, Any]:
+    """고객사 가중치 데이터 로드 (캐싱)"""
+    global _customer_weights_cache
+    
+    if _customer_weights_cache is not None:
+        return _customer_weights_cache
+    
+    try:
+        if os.path.exists(CUSTOMER_WEIGHTS_FILE):
+            with open(CUSTOMER_WEIGHTS_FILE, 'r', encoding='utf-8') as f:
+                _customer_weights_cache = json.load(f)
+                logger.info(f"✅ 고객사 가중치 데이터 로드 완료: {len(_customer_weights_cache)}개")
+                return _customer_weights_cache
+        else:
+            logger.warning(f"⚠️ 고객사 가중치 파일 없음: {CUSTOMER_WEIGHTS_FILE}")
+            return {}
+    except Exception as e:
+        logger.error(f"❌ 고객사 가중치 로드 실패: {str(e)}")
+        return {}
+
+def extract_customer_name(epic_title: str) -> Optional[str]:
+    """Epic 제목에서 고객사명 추출
+    
+    예: 
+    - "[경남은행] 대기톡 건수 조절" → "경남은행"
+    - "[구축][프로젝트] 케이뱅크 멀티채널..." → "케이뱅크"
+    - "[삼성카드][구축/고도화] ..." → "삼성카드"
+    """
+    if not epic_title:
+        return None
+    
+    # 1. 먼저 대괄호 안에서 고객사명 찾기 (정확한 매칭)
+    # [경남은행], [삼성카드] 같은 패턴
+    brackets = re.findall(r'\[(.*?)\]', epic_title)
+    
+    # 고객사 목록 로드
+    customer_weights = load_customer_weights()
+    if not customer_weights:
+        return None
+    
+    customer_names = list(customer_weights.keys())
+    
+    # 1-1. 대괄호 안에 있는 텍스트가 고객사 목록에 있는지 확인
+    for bracket_text in brackets:
+        bracket_text = bracket_text.strip()
+        if bracket_text in customer_names:
+            logger.info(f"✅ 대괄호에서 고객사명 발견: {bracket_text}")
+            return bracket_text
+    
+    # 2. 대괄호에서 못 찾으면, Epic 제목 전체에서 고객사명 검색
+    # "[구축][프로젝트] 케이뱅크 멀티채널..." 같은 패턴
+    
+    # 2-1. 정확한 매칭 우선 (공백으로 구분된 단어 단위)
+    title_words = re.split(r'[\s\[\]]+', epic_title)
+    for word in title_words:
+        word = word.strip()
+        if word in customer_names:
+            logger.info(f"✅ 제목에서 고객사명 발견 (단어 매칭): {word}")
+            return word
+    
+    # 2-2. 부분 문자열 매칭 (긴 고객사명부터 확인)
+    # 예: "한국카카오은행"이 "카카오은행"보다 먼저 매칭되도록
+    sorted_customers = sorted(customer_names, key=len, reverse=True)
+    
+    for customer in sorted_customers:
+        if customer in epic_title:
+            logger.info(f"✅ 제목에서 고객사명 발견 (부분 매칭): {customer}")
+            return customer
+    
+    logger.info(f"ℹ️ 고객사명을 찾을 수 없음: {epic_title[:50]}...")
+    return None
+
+def analyze_customer_risk(customer_name: str, total_days: float) -> Dict[str, Any]:
+    """고객사 가중치 기반 리스크 분석
+    
+    Returns:
+        dict: {
+            'customer_data': dict,  # 고객사 정보
+            'risks': list,          # 리스크 항목들
+            'buffer_percent': int,  # 버퍼 비율 (%)
+            'buffer_days': float    # 버퍼 일수
+        }
+    """
+    customer_weights = load_customer_weights()
+    
+    if customer_name not in customer_weights:
+        return {
+            'customer_data': None,
+            'risks': [],
+            'buffer_percent': 0,
+            'buffer_days': 0
+        }
+    
+    customer_data = customer_weights[customer_name]
+    weights = customer_data.get('가중치', {})
+    
+    risks = []
+    buffer = 0
+    
+    # 1. 요구사항 명확성 체크 (>4.0이면 위험)
+    req_clarity = weights.get('요구사항명확성', 3.0)
+    if req_clarity >= 4.0:
+        risks.append(f"요구사항이 명확하지 않음 (지수: {req_clarity:.2f})")
+        buffer += 15
+    elif req_clarity >= 3.5:
+        risks.append(f"요구사항의 구체성이 다소 부족 (지수: {req_clarity:.2f})")
+        buffer += 10
+    
+    # 2. 개발 유연성 체크 (>3.0이면 주의)
+    dev_flex = weights.get('개발유연성측정', 3.0)
+    if dev_flex >= 3.5:
+        risks.append(f"요구사항 변경 대응이 어려움 (지수: {dev_flex:.2f})")
+        buffer += 15
+    elif dev_flex >= 3.0:
+        risks.append(f"요구사항 변경 시 협의 필요 (지수: {dev_flex:.2f})")
+        buffer += 10
+    
+    # 3. 고객 소통 체크 (>3.0이면 주의)
+    communication = weights.get('고객소통정도', 3.0)
+    if communication >= 3.5:
+        risks.append(f"고객 소통이 원활하지 않음 (지수: {communication:.2f})")
+        buffer += 15
+    elif communication >= 3.0:
+        risks.append(f"고객 소통에 시간 소요 (지수: {communication:.2f})")
+        buffer += 10
+    
+    # 4. 요구사항 변경 수준 체크 (>1.2이면 위험)
+    change_level = weights.get('요구사항변경수준', 1.0)
+    if change_level >= 1.3:
+        risks.append(f"요구사항 변경이 빈번함 (지수: {change_level:.2f})")
+        buffer += 15
+    elif change_level >= 1.15:
+        risks.append(f"요구사항 변경 가능성 있음 (지수: {change_level:.2f})")
+        buffer += 10
+    
+    # 5. 사이트 업무 복잡도 체크 (>1.1이면 복잡)
+    complexity = weights.get('사이트업무복잡도', 1.0)
+    if complexity >= 1.2:
+        risks.append(f"사이트 업무 복잡도가 높음 (지수: {complexity:.2f})")
+        buffer += 10
+    elif complexity >= 1.1:
+        risks.append(f"사이트 업무가 다소 복잡 (지수: {complexity:.2f})")
+        buffer += 5
+    
+    buffer_days = round(total_days * buffer / 100, 1)
+    
+    return {
+        'customer_data': customer_data,
+        'risks': risks,
+        'buffer_percent': buffer,
+        'buffer_days': buffer_days
+    }
 
 def classify_task_phase(title: str) -> str:
     """작업 제목을 기반으로 단계 분류
@@ -270,6 +429,58 @@ def run_effort_qa_chain(question: str) -> dict:
                             # 요약 실패 시 단순 통계 정보 제공 (담당자 정보 제외)
                             answer_parts.append("💡 요약:")
                             answer_parts.append(f"총 {total_count}개 작업으로 구성된 프로젝트이며, 총 공수는 {total_points_rounded}일입니다.\n")
+                        
+                        # 3-1. 고객사 특성 분석 (가중치 기반)
+                        try:
+                            customer_name = extract_customer_name(epic_data['epic_name'])
+                            
+                            if customer_name:
+                                logger.info(f"🏢 고객사명 추출: {customer_name}")
+                                risk_analysis = analyze_customer_risk(customer_name, total_points)
+                                
+                                if risk_analysis['customer_data']:
+                                    customer_data = risk_analysis['customer_data']
+                                    weights = customer_data.get('가중치', {})
+                                    
+                                    answer_parts.append("🏢 고객사 특성 분석:")
+                                    answer_parts.append(f"   • 고객사: {customer_name}")
+                                    
+                                    # 난이도 분류 표시
+                                    difficulty = customer_data.get('난이도분류', 'N/A')
+                                    if difficulty and str(difficulty).strip():
+                                        answer_parts.append(f"   • 난이도 등급: {difficulty}")
+                                    
+                                    # 주요 가중치 지수 표시 (1~5 스케일)
+                                    answer_parts.append(f"   • 요구사항 명확성: {weights.get('요구사항명확성', 3.0):.2f}/5.0 (낮을수록 명확)")
+                                    answer_parts.append(f"   • 개발 유연성: {weights.get('개발유연성측정', 3.0):.2f}/5.0 (낮을수록 유연)")
+                                    answer_parts.append(f"   • 고객 소통: {weights.get('고객소통정도', 3.0):.2f}/5.0 (낮을수록 원활)")
+                                    answer_parts.append(f"   • 요구사항 변경: {weights.get('요구사항변경수준', 1.0):.2f}/1.5 (낮을수록 안정)")
+                                    
+                                    # 리스크가 있으면 경고 표시
+                                    if risk_analysis['risks']:
+                                        answer_parts.append(f"\n   ⚠️ 주의사항:")
+                                        for risk in risk_analysis['risks']:
+                                            answer_parts.append(f"      - {risk}")
+                                        
+                                        # 간단한 조언만 제공
+                                        answer_parts.append(f"\n   💡 해당 고객사는 요구사항 변경이나 소통 이슈가 있을 수 있어 일정 산정 시 여유를 두는 것을 권장합니다.\n")
+                                        
+                                        # 수치는 참고용으로 주석 처리
+                                        # buffer_percent = risk_analysis['buffer_percent']
+                                        # buffer_days = risk_analysis['buffer_days']
+                                        # recommended_total = round(total_points + buffer_days, 1)
+                                        # answer_parts.append(f"\n   💡 권장 버퍼: +{buffer_percent}% ({buffer_days}일)")
+                                        # answer_parts.append(f"   💡 권장 총 공수: {recommended_total}일 (버퍼 포함)\n")
+                                    else:
+                                        # 리스크가 없는 협조적인 고객사
+                                        answer_parts.append(f"\n   ✅ 협조적인 고객사로 표준 공수로 충분합니다.\n")
+                                else:
+                                    logger.info(f"ℹ️ 고객사 '{customer_name}' 정보 없음")
+                            else:
+                                logger.info(f"ℹ️ Epic 제목에서 고객사명 추출 실패")
+                                
+                        except Exception as customer_error:
+                            logger.warning(f"⚠️ 고객사 특성 분석 실패: {str(customer_error)}")
                         
                         # 4. 주요 작업 목록 (최대 10개)
                         answer_parts.append("📝 주요 작업 목록:")

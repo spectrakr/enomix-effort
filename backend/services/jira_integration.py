@@ -509,20 +509,26 @@ class JiraIntegration:
                     # TODO: (n), (/) 필터링 로직 추가 필요 (사용자 확인 후)
                 
                 # Story Point 기반 공수 산정 데이터 생성
+                sp_value = story_points_data['story_points'] or 0
+                sp_original = story_points_data.get('story_points_original')
+                sp_unit = story_points_data.get('story_points_unit')
+                
+                logger.info(f"📊 EffortEstimation 생성 준비: story_points={sp_value} (원본: {sp_original} {sp_unit})")
+                
                 estimation = EffortEstimation(
                     jira_ticket=jira_ticket,
                     title=title,
-                    story_points=story_points_data['story_points'] or 0,
+                    story_points=sp_value,
                     estimation_reason=None,  # 수동 입력만 사용
                     team_member=team_member,
                     description=description if description else None,
                     comments=None,  # 파일 용량 절감 (comments는 제외)
                     notes=f"상태: {status}",
-                    story_points_original=story_points_data.get('story_points_original'),
-                    story_points_unit=story_points_data.get('story_points_unit')
+                    story_points_original=sp_original,
+                    story_points_unit=sp_unit
                 )
                 
-                logger.info(f"✅ 생성된 공수 산정 데이터: {estimation}")
+                logger.info(f"✅ EffortEstimation 생성 완료: {jira_ticket} story_points={estimation.story_points}")
                 
                 estimations.append(estimation)
                 
@@ -654,9 +660,9 @@ class JiraIntegration:
                             logger.info(f"🔄 리스트 필드: {field_key} = {field_value}")
                             for item in field_value:
                                 if isinstance(item, (int, float)) and item > 0:
-                                    original_value = float(item)
+                                    original_value = round(float(item), 2)
                                     if field_key == 'customfield_10124':
-                                        converted_value = original_value * 20
+                                        converted_value = round(original_value * 20, 2)
                                         logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
                                         return {
                                             'story_points': converted_value,
@@ -672,10 +678,10 @@ class JiraIntegration:
                                         }
                                 elif isinstance(item, str) and item.strip():
                                     try:
-                                        original_value = float(item)
+                                        original_value = round(float(item), 2)
                                         if original_value > 0:
                                             if field_key == 'customfield_10124':
-                                                converted_value = original_value * 20
+                                                converted_value = round(original_value * 20, 2)
                                                 logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
                                                 return {
                                                     'story_points': converted_value,
@@ -703,7 +709,7 @@ class JiraIntegration:
             for field_key, field_value in fields.items():
                 if 'customfield' in field_key and field_value is not None:
                     if isinstance(field_value, (int, float)) and 0.5 <= field_value <= 100:
-                        original_value = float(field_value)
+                        original_value = round(float(field_value), 2)
                         logger.info(f"✅ Story Points 후보 발견: {field_key} = {original_value}")
                         # M/D로 가정
                         return {

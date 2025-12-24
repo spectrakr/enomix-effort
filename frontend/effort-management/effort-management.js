@@ -1275,7 +1275,7 @@ async function deleteEffortData(jiraTicket, title) {
     
     if (response.ok) {
       showToast('✅ 데이터가 삭제되었습니다', 'success');
-      loadEffortList(); // 목록 새로고침
+      loadEffortList(currentPage); // 현재 페이지 유지하며 목록 새로고침
     } else {
       showToast(`❌ 삭제 실패: ${result.error || '알 수 없는 오류'}`, 'error');
     }
