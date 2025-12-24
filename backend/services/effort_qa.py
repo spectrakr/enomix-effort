@@ -39,23 +39,32 @@ def classify_task_phase(title: str) -> str:
     if any(keyword in title_lower for keyword in analysis_keywords):
         return 'analysis'
     
-    # 3. 구현
-    implementation_keywords = ['개발', '구현', '코딩', '작업', '프로그램', 'api', '배치', 'i/f', '인터페이스', 'batch', 'implement', 'develop']
-    if any(keyword in title_lower for keyword in implementation_keywords):
-        return 'implementation'
-    
-    # 4. 테스트/모니터링
+    # 3. 테스트/모니터링
     test_keywords = ['테스트', 'qa', '검증', '모니터링', '결과보완', 'test', 'verify', 'validation']
     if any(keyword in title_lower for keyword in test_keywords):
         return 'test'
     
-    # 5. 반영/이행
+    # 4. 반영/이행
     deployment_keywords = ['반영', '이행', '배포', '적용', '릴리즈', 'deploy', 'release', '오픈']
     if any(keyword in title_lower for keyword in deployment_keywords):
         return 'deployment'
     
-    # 6. 기타
-    return 'etc'
+    # 5. 기타 (명시적 키워드 - 개발/구현이 아닌 것들)
+    etc_keywords = [
+        '데이터이관', '이관', '마이그레이션', 'migration',
+        '백업', '복구', 'backup', 'restore',
+        '문서화', '문서작성', '문서', '매뉴얼', '가이드', 'documentation', 'manual',
+        '교육', '트레이닝', 'training',
+        '회의', '미팅', 'meeting',
+        '산출물', '보고', '보고서', '리포트', 'report',
+        '조사', '리서치', 'research',
+        '철수', '회고', '실사', '반입', '반출'
+    ]
+    if any(keyword in title_lower for keyword in etc_keywords):
+        return 'etc'
+    
+    # 6. 구현 (디폴트 - 위에 해당 안 되면 모두 구현으로 분류)
+    return 'implementation'
 
 def aggregate_epic_story_points(epic_keyword: str) -> dict:
     """Epic 키워드로 하위 Task들을 검색하고 Story Points 집계"""
