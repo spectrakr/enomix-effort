@@ -5,6 +5,7 @@ Jira API를 통한 공수 산정 데이터 수집
 
 import requests
 import logging
+import re
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 import os
@@ -42,42 +43,72 @@ class JiraIntegration:
             logger.error(f"❌ Jira 연결 오류: {str(e)}")
             return False
     
-    def test_epic_subtasks(self, epic_key: str) -> dict:
-        """Epic의 하위 Task들 조회 테스트"""
+    def test_epic_subtasks(self, epic_key: str, include_details: bool = False) -> dict:
+        """Epic의 하위 Task들 조회 테스트
+        
+        Args:
+            epic_key: Epic 키 (예: ENOMIX-123)
+            include_details: description/comments 포함 여부 (WORK 프로젝트용, 느림)
+        """
         try:
-            # 먼저 Epic 자체가 존재하는지 확인 (타입 검증 완화)
-            epic_info = self.test_epic_basic_info(epic_key)
-            if not epic_info:
-                logger.warning(f"⚠️ Epic '{epic_key}' 조회 실패, 직접 하위 작업 조회 시도")
-                # Epic 조회가 실패해도 직접 하위 작업 조회 시도
+            logger.info(f"🔍 Epic '{epic_key}' 하위 작업 조회 시작 (상세 정보: {'포함' if include_details else '제외'})")
+            
+            subtasks_dict = {}  # key를 기준으로 중복 제거용 딕셔너리
+            
+            # 1단계: Epic의 내부 ID 가져오기
+            issue_url = f"{self.jira_url}/rest/api/3/issue/{epic_key}"
+            params = {'fields': 'id,key,summary'}
+            
+            logger.info(f"🔍 1단계: Epic ID 조회")
+            epic_response = self.session.get(issue_url, params=params)
+            
+            epic_id = None
+            epic_data = None
+            if epic_response.status_code == 200:
+                epic_data = epic_response.json()
+                epic_id = epic_data.get('id')
+                logger.info(f"✅ Epic 내부 ID: {epic_id} (Key: {epic_key})")
             else:
-                logger.info(f"✅ Epic '{epic_key}' 조회 성공, 하위 작업 조회 진행")
+                logger.warning(f"⚠️ Epic 조회 실패: {epic_response.status_code}")
+            
+            # 2단계: Epic ID를 사용하여 parent 관계로 검색 (가장 확실한 방법)
+            logger.info(f"🔍 2단계: Epic ID로 parent 관계 검색")
             
             search_url = f"{self.jira_url}/rest/api/3/search/jql"
-            fields = 'key,summary,status,issuetype,assignee,customfield_10105'
             
-            # 여러 JQL 쿼리 시도 (효과적인 것부터)
+            # 기본 필드 + description 조회 (comments만 제외)
+            fields = 'key,summary,status,issuetype,assignee,customfield_10105,customfield_10124,parent,description'
+            logger.info("📝 기본 정보 + description 조회 (comments 제외)")
+            
+            # 여러 JQL 쿼리 시도 (ID 기반 검색 우선)
             project_key = epic_key.split("-")[0]
-            jql_queries = [
+            jql_queries = []
+            
+            # Epic ID가 있으면 ID 기반 검색 우선 (프로젝트 제한 없음)
+            if epic_id:
+                jql_queries.extend([
+                    f'parent = {epic_id}',  # Epic ID로 부모 검색 (가장 정확)
+                    f'parent = {epic_id} OR "Epic Link" = {epic_key}',  # ID + Key 조합
+                    f'cf[10014] = {epic_key}',  # Epic Link 커스텀 필드 (ID: 10014)
+                ])
+            
+            # 기존 JQL 쿼리들
+            jql_queries.extend([
                 f'"Epic Link" = {epic_key}',  # 가장 효과적인 Epic 하위 작업 조회
-                f'parent = {epic_key}',  # 부모-자식 관계
+                f'parent = {epic_key}',  # 부모-자식 관계 (Key로)
                 f'epic = {epic_key}',  # Epic 필드
                 f'project = {project_key} AND "Epic Link" = {epic_key}',  # 프로젝트 + Epic Link
                 f'project = {project_key} AND parent = {epic_key}',  # 프로젝트 + 부모
-                f'project = {project_key} AND issuetype in (Task, Story, Bug) AND "Epic Link" = {epic_key}',  # 작업 타입 + Epic Link
-                f'project = {project_key} AND issuetype in (Task, Story, Bug) AND parent = {epic_key}',  # 작업 타입 + 부모
+                f'cf[10018] = {epic_key}',  # Parent Link 커스텀 필드 (ID: 10018)
+                f'issue in linkedIssues({epic_key})',  # 링크된 이슈
                 f'parent in ({epic_key})',  # 부모 IN
                 f'"Epic Link" in ({epic_key})',  # Epic Link IN
-                f'issue in linkedIssues({epic_key}, "is child of")',  # 링크된 이슈 (자식)
-                f'issue in linkedIssues({epic_key})',  # 링크된 이슈
-                f'key = {epic_key}',  # Epic 자체
-                f'project = {project_key} AND key = {epic_key}',  # 프로젝트 + Epic
-                f'project = {project_key} AND issuetype = Epic',  # 프로젝트의 모든 Epic
-                f'project = {project_key}',  # 프로젝트의 모든 이슈
-                f'issue in linkedIssues({epic_key}, "is parent of")',  # 링크된 이슈 (부모)
-                f'issue in linkedIssues({epic_key}, "relates to")',  # 링크된 이슈 (관련)
-                f'project = {project_key} AND summary ~ "{epic_key}"'  # 제목 검색
-            ]
+            ])
+            
+            if epic_id:
+                jql_queries.append(f'parent in ({epic_id})')  # Epic ID IN
+            
+            jql_results = []  # 각 JQL 결과 기록용
             
             for i, jql in enumerate(jql_queries, 1):
                 try:
@@ -91,7 +122,7 @@ class JiraIntegration:
                     
                     params = {
                         'jql': jql,
-                        'maxResults': 50,
+                        'maxResults': 200,  # 더 많은 결과 가져오기
                         'fields': fields,
                         'expand': 'changelog'
                     }
@@ -104,48 +135,159 @@ class JiraIntegration:
                         issues = results.get('issues', [])
                         issues_count = len(issues)
                         
-                        logger.info(f"✅ JQL {i} 성공: total={total}, issues_count={issues_count}")
+                        logger.info(f"✅ JQL {i} 성공: total={total}, issues_count={issues_count}, maxResults={params['maxResults']}")
+                        
+                        if total > issues_count:
+                            logger.warning(f"⚠️ JQL {i}: total({total}) > issues_count({issues_count}), maxResults 제한으로 일부만 가져옴")
+                        
+                        jql_result = {
+                            "jql": jql,
+                            "status": "success",
+                            "total": total,
+                            "fetched": issues_count,
+                            "added": 0
+                        }
                         
                         if issues_count > 0:
-                            subtasks = []
+                            found_count = 0
                             for issue in issues:
-                                subtask = {
-                                    'key': issue['key'],
-                                    'summary': issue['fields']['summary'],
-                                    'status': issue['fields']['status']['name'],
-                                    'issue_type': issue['fields']['issuetype']['name'],
-                                    'assignee': issue['fields'].get('assignee', {}).get('displayName', 'N/A'),
-                                    'story_points': issue['fields'].get('customfield_10105', 0)
-                                }
-                                subtasks.append(subtask)
+                                try:
+                                    issue_key = issue.get('key', 'N/A')
+                                    fields = issue.get('fields', {})
+                                    
+                                    if not fields:
+                                        logger.warning(f"⚠️ 필드가 없는 이슈: {issue_key}")
+                                        continue
+                                    
+                                    # issuetype 안전하게 추출
+                                    issuetype_obj = fields.get('issuetype')
+                                    if not issuetype_obj or not isinstance(issuetype_obj, dict):
+                                        logger.warning(f"⚠️ issuetype 필드가 없거나 잘못된 이슈: {issue_key}")
+                                        continue
+                                    issue_type = issuetype_obj.get('name', 'Unknown')
+                                    
+                                    # Epic 자체는 제외 (하위 작업만 가져오기)
+                                    if issue_key == epic_key:
+                                        logger.info(f"⚠️ Epic 자체를 발견하여 제외: {issue_key}")
+                                        continue
+                                    
+                                    # Epic 타입도 제외
+                                    if issue_type in ['Epic', '에픽']:
+                                        logger.info(f"⚠️ Epic 타입 발견하여 제외: {issue_key} ({issue_type})")
+                                        continue
+                                    
+                                    # status 안전하게 추출
+                                    status_obj = fields.get('status')
+                                    status_name = 'N/A'
+                                    if status_obj and isinstance(status_obj, dict):
+                                        status_name = status_obj.get('name', 'N/A')
+                                    
+                                    # assignee 안전하게 추출
+                                    assignee_obj = fields.get('assignee')
+                                    assignee_name = 'N/A'
+                                    if assignee_obj and isinstance(assignee_obj, dict):
+                                        assignee_name = assignee_obj.get('displayName', 'N/A')
+                                    
+                                    # summary 안전하게 추출
+                                    summary = fields.get('summary', 'N/A')
+                                    
+                                    # story_points 안전하게 추출 (ENOMIX: customfield_10105, WORK: customfield_10124)
+                                    story_points_data = self._extract_story_points(fields)
+                                    
+                                    # description 안전하게 추출 (panel 필터링 적용)
+                                    description = fields.get('description', '')
+                                    if description and isinstance(description, dict):
+                                        description = self._extract_text_from_adf(description)
+                                    
+                                    # 중복 체크 후 추가 (comments만 제외)
+                                    if issue_key not in subtasks_dict:
+                                        subtask = {
+                                            'key': issue_key,
+                                            'summary': summary,
+                                            'status': status_name,
+                                            'issue_type': issue_type,
+                                            'assignee': assignee_name,
+                                            'story_points': story_points_data['story_points'],  # M/D 단위
+                                            'story_points_original': story_points_data.get('story_points_original'),
+                                            'story_points_unit': story_points_data.get('story_points_unit'),
+                                            'description': description if description else None
+                                        }
+                                        subtasks_dict[issue_key] = subtask
+                                        found_count += 1
+                                        
+                                except Exception as issue_error:
+                                    logger.warning(f"⚠️ 이슈 처리 중 오류 ({issue.get('key', 'Unknown')}): {str(issue_error)}")
+                                    continue
                             
-                            logger.info(f"✅ Epic 하위 작업 조회 성공: {len(subtasks)}개")
-                            return {
-                                "success": True,
-                                "epic_key": epic_key,
-                                "subtasks": subtasks,
-                                "total": len(subtasks),
-                                "jql_used": jql
-                            }
-                        else:
-                            logger.info(f"JQL {i}: 하위 작업 없음")
+                            jql_result["added"] = found_count
+                            
+                            # 조기 종료 체크 (found_count와 무관하게 전체 dict 크기로 판단)
+                            should_break = False
+                            if i == 1 and len(subtasks_dict) >= 1:
+                                logger.info(f"✅✅✅ 1번 JQL(Epic ID)에서 {len(subtasks_dict)}개 발견, 즉시 종료 ✅✅✅")
+                                should_break = True
+                            elif i <= 3 and len(subtasks_dict) >= 5:
+                                logger.info(f"✅ Epic ID 기반 JQL에서 {len(subtasks_dict)}개 발견, 조기 종료")
+                                should_break = True
+                            elif len(subtasks_dict) >= 30:
+                                logger.info(f"✅ 충분한 하위 작업({len(subtasks_dict)}개)을 찾아 조기 종료")
+                                should_break = True
+                            
+                            if found_count > 0:
+                                logger.info(f"✅ JQL {i}에서 {found_count}개 하위 작업 추가 (현재 총 {len(subtasks_dict)}개)")
+                            
+                            jql_results.append(jql_result)
+                            
+                            if should_break:
+                                break
                     else:
                         logger.warning(f"JQL {i} 실패: {response.status_code}")
+                        jql_results.append({
+                            "jql": jql,
+                            "status": "failed",
+                            "status_code": response.status_code
+                        })
                         
                 except Exception as e:
                     logger.warning(f"JQL {i} 오류: {str(e)}")
+                    jql_results.append({
+                        "jql": jql,
+                        "status": "error",
+                        "error": str(e)
+                    })
                     continue
             
-            # 모든 JQL이 실패한 경우
-            logger.error(f"❌ 모든 JQL 쿼리 실패: {epic_key}")
-            return {
-                "success": False,
-                "epic_key": epic_key,
-                "subtasks": [],
-                "total": 0,
-                "error": f"Epic '{epic_key}'의 하위 작업을 찾을 수 없습니다. Jira 설정을 확인해주세요.",
-                "tried_queries": jql_queries
-            }
+            # 모든 검색 완료 후 최종 결과 반환
+            if subtasks_dict:
+                subtasks_list = list(subtasks_dict.values())
+                logger.info(f"✅ 최종 Epic 하위 작업 조회 완료: {len(subtasks_list)}개")
+                
+                # 디버깅 정보 추가
+                debug_info = {
+                    "epic_id": epic_id if epic_id else "N/A",
+                    "total_jql_tried": len(jql_queries),
+                    "final_count": len(subtasks_list),
+                    "jql_results": jql_results if 'jql_results' in locals() else []
+                }
+                
+                return {
+                    "success": True,
+                    "epic_key": epic_key,
+                    "subtasks": subtasks_list,
+                    "total": len(subtasks_list),
+                    "jql_used": "Epic ID-based parent search",
+                    "debug": debug_info
+                }
+            else:
+                logger.error(f"❌ 모든 검색 방법 실패: {epic_key}")
+                return {
+                    "success": False,
+                    "epic_key": epic_key,
+                    "subtasks": [],
+                    "total": 0,
+                    "error": f"Epic '{epic_key}'의 하위 작업을 찾을 수 없습니다. Jira 설정을 확인해주세요.",
+                    "tried_queries": jql_queries
+                }
                 
         except Exception as e:
             logger.error(f"❌ Epic 하위 Task 검색 오류: {str(e)}")
@@ -158,6 +300,55 @@ class JiraIntegration:
             }
 
 
+    def search_completed_epics(self) -> List[Dict[str, Any]]:
+        """완료된 Epic 목록 조회 (구축 관련, ENOMIX 프로젝트만)"""
+        try:
+            search_url = f"{self.jira_url}/rest/api/3/search/jql"
+            
+            # JQL: 완료된 Epic만 조회 (ENOMIX 프로젝트만)
+            jql = f'''
+                project = ENOMIX
+                AND issuetype = Epic 
+                AND status = Done 
+                AND assignee != empty 
+                AND textfields ~ "구축*"
+                ORDER BY created DESC
+            '''
+            
+            logger.info(f"🔍 ENOMIX 프로젝트의 완료된 Epic 검색 중...")
+            
+            params = {
+                'jql': jql,
+                'maxResults': 100,
+                'fields': 'key,summary,status,assignee'
+            }
+            
+            logger.info(f"🔍 완료된 Epic 검색 시작")
+            response = self.session.get(search_url, params=params)
+            
+            if response.status_code == 200:
+                results = response.json()
+                issues = results.get('issues', [])
+                logger.info(f"✅ 완료된 Epic 검색 성공: {len(issues)}개")
+                
+                epics = []
+                for issue in issues:
+                    epics.append({
+                        'key': issue['key'],
+                        'summary': issue['fields']['summary'],
+                        'status': issue['fields']['status']['name'],
+                        'assignee': issue['fields'].get('assignee', {}).get('displayName', 'N/A') if issue['fields'].get('assignee') else 'N/A'
+                    })
+                
+                return epics
+            else:
+                logger.error(f"❌ 완료된 Epic 검색 실패: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"❌ 완료된 Epic 검색 오류: {str(e)}")
+            return []
+    
     def test_epic_basic_info(self, epic_key: str) -> Dict[str, Any]:
         """Epic 기본 정보 조회 테스트 - JQL 테스트와 동일한 방식 사용"""
         try:
@@ -214,7 +405,7 @@ class JiraIntegration:
             # API v3 사용
             url = f"{self.jira_url}/rest/api/3/issue/{ticket_key}"
             params = {
-                'fields': 'summary,description,status,assignee,created,updated,issuetype,customfield_10105,customfield_10016,customfield_10020,customfield_10021'
+                'fields': 'summary,description,status,assignee,created,updated,issuetype,customfield_10105,customfield_10124,customfield_10016,customfield_10020,customfield_10021'
             }
             
             logger.info(f"🔄 Jira API 호출: {url}")
@@ -246,7 +437,7 @@ class JiraIntegration:
                 logger.info(f"✅ 허용된 티켓 타입: {issue_type_name}")
                 
                 # Story Points 관련 필드들 확인
-                for field_key in ['customfield_10105', 'customfield_10016', 'customfield_10020', 'customfield_10021']:
+                for field_key in ['customfield_10105', 'customfield_10124', 'customfield_10016', 'customfield_10020', 'customfield_10021']:
                     if field_key in fields:
                         logger.info(f"🔄 {field_key}: {fields[field_key]} (타입: {type(fields[field_key]).__name__})")
                 
@@ -286,9 +477,9 @@ class JiraIntegration:
                 jira_ticket = issue.get('key', '')
                 title = fields.get('summary', '')
                 
-                # Story Points 추출
-                story_points = self._extract_story_points(fields)
-                logger.info(f"🔄 추출된 Story Points: {story_points}")
+                # Story Points 추출 (M/D 단위로 통일)
+                story_points_data = self._extract_story_points(fields)
+                logger.info(f"🔄 추출된 Story Points: {story_points_data['story_points']} M/D (원본: {story_points_data['story_points_original']} {story_points_data['story_points_unit']})")
                 
                 # 담당자 정보
                 assignee = fields.get('assignee', {})
@@ -309,19 +500,26 @@ class JiraIntegration:
                 # 상태 정보
                 status = fields.get('status', {}).get('name', '')
                 
-                # 설명에서 산정 이유 추출 시도
+                # Description 추출 및 필터링
                 description = fields.get('description', '')
-                estimation_reason = self._extract_reason_from_description(description)
+                if description:
+                    # ADF(Atlassian Document Format) 형식인 경우 텍스트 추출
+                    if isinstance(description, dict):
+                        description = self._extract_text_from_adf(description)
+                    # TODO: (n), (/) 필터링 로직 추가 필요 (사용자 확인 후)
                 
                 # Story Point 기반 공수 산정 데이터 생성
                 estimation = EffortEstimation(
                     jira_ticket=jira_ticket,
                     title=title,
-                    story_points=story_points or 0,
-                    estimation_reason=estimation_reason,
+                    story_points=story_points_data['story_points'] or 0,
+                    estimation_reason=None,  # 수동 입력만 사용
                     team_member=team_member,
                     description=description if description else None,
-                    notes=f"상태: {status}"
+                    comments=None,  # 파일 용량 절감 (comments는 제외)
+                    notes=f"상태: {status}",
+                    story_points_original=story_points_data.get('story_points_original'),
+                    story_points_unit=story_points_data.get('story_points_unit')
                 )
                 
                 logger.info(f"✅ 생성된 공수 산정 데이터: {estimation}")
@@ -334,14 +532,23 @@ class JiraIntegration:
         
         return estimations
     
-    def _extract_story_points(self, fields: Dict) -> float:
-        """Jira 필드에서 Story Points 추출"""
+    def _extract_story_points(self, fields: Dict) -> Dict[str, Any]:
+        """Jira 필드에서 Story Points 추출 (M/D 단위로 통일)
+        
+        Returns:
+            dict: {
+                'story_points': float,  # M/D 단위
+                'story_points_original': float,  # 원본 값
+                'story_points_unit': str  # 원본 단위 (M/D 또는 M/M)
+            }
+        """
         try:
             logger.info(f"🔄 Story Points 추출 시작. 사용 가능한 필드: {list(fields.keys())}")
             
             # 우선순위 필드들 (실제 Story Points 필드가 맨 앞)
             priority_fields = [
-                'customfield_10105',  # 실제 Story Points 필드
+                'customfield_10105',  # ENOMIX Story Points 필드 (M/D)
+                'customfield_10124',  # WORK 프로젝트 "분석 공수(M/M)-work" 필드
                 'customfield_10016',  # 일반적인 Story Points 필드
                 'customfield_10020', 'customfield_10021', 'customfield_10014', 
                 'customfield_10015', 'customfield_10017', 'customfield_10019'
@@ -356,15 +563,46 @@ class JiraIntegration:
                     if field_value is not None:
                         # 숫자 값인 경우
                         if isinstance(field_value, (int, float)) and field_value > 0:
-                            logger.info(f"✅ Story Points 발견: {field_key} = {field_value}")
-                            return float(field_value)
+                            original_value = float(field_value)
+                            
+                            # WORK 프로젝트의 M/M 필드인 경우 M/D로 변환 (1 M/M = 20 M/D)
+                            if field_key == 'customfield_10124':
+                                converted_value = original_value * 20
+                                logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
+                                return {
+                                    'story_points': converted_value,
+                                    'story_points_original': original_value,
+                                    'story_points_unit': 'M/M'
+                                }
+                            else:
+                                # ENOMIX Story Points (이미 M/D 단위)
+                                logger.info(f"✅ Story Points 발견: {field_key} = {original_value} M/D")
+                                return {
+                                    'story_points': original_value,
+                                    'story_points_original': original_value,
+                                    'story_points_unit': 'M/D'
+                                }
                         # 문자열인 경우
                         elif isinstance(field_value, str) and field_value.strip():
                             try:
-                                num_value = float(field_value)
-                                if num_value > 0:
-                                    logger.info(f"✅ Story Points 발견: {field_key} = {field_value}")
-                                    return float(num_value)
+                                original_value = float(field_value)
+                                if original_value > 0:
+                                    # WORK 프로젝트의 M/M 필드인 경우 변환
+                                    if field_key == 'customfield_10124':
+                                        converted_value = original_value * 20
+                                        logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
+                                        return {
+                                            'story_points': converted_value,
+                                            'story_points_original': original_value,
+                                            'story_points_unit': 'M/M'
+                                        }
+                                    else:
+                                        logger.info(f"✅ Story Points 발견: {field_key} = {original_value} M/D")
+                                        return {
+                                            'story_points': original_value,
+                                            'story_points_original': original_value,
+                                            'story_points_unit': 'M/D'
+                                        }
                             except ValueError:
                                 logger.info(f"⚠️ 숫자 변환 실패: {field_key} = {field_value}")
                         # 딕셔너리인 경우
@@ -375,13 +613,40 @@ class JiraIntegration:
                                     sub_value = field_value[sub_key]
                                     try:
                                         if isinstance(sub_value, (int, float)) and sub_value > 0:
-                                            logger.info(f"✅ Story Points 발견: {field_key}.{sub_key} = {sub_value}")
-                                            return float(sub_value)
+                                            original_value = float(sub_value)
+                                            if field_key == 'customfield_10124':
+                                                converted_value = original_value * 20
+                                                logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
+                                                return {
+                                                    'story_points': converted_value,
+                                                    'story_points_original': original_value,
+                                                    'story_points_unit': 'M/M'
+                                                }
+                                            else:
+                                                logger.info(f"✅ Story Points 발견: {field_key}.{sub_key} = {original_value} M/D")
+                                                return {
+                                                    'story_points': original_value,
+                                                    'story_points_original': original_value,
+                                                    'story_points_unit': 'M/D'
+                                                }
                                         elif isinstance(sub_value, str) and sub_value.strip():
-                                            num_value = float(sub_value)
-                                            if num_value > 0:
-                                                logger.info(f"✅ Story Points 발견: {field_key}.{sub_key} = {sub_value}")
-                                                return float(num_value)
+                                            original_value = float(sub_value)
+                                            if original_value > 0:
+                                                if field_key == 'customfield_10124':
+                                                    converted_value = original_value * 20
+                                                    logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
+                                                    return {
+                                                        'story_points': converted_value,
+                                                        'story_points_original': original_value,
+                                                        'story_points_unit': 'M/M'
+                                                    }
+                                                else:
+                                                    logger.info(f"✅ Story Points 발견: {field_key}.{sub_key} = {original_value} M/D")
+                                                    return {
+                                                        'story_points': original_value,
+                                                        'story_points_original': original_value,
+                                                        'story_points_unit': 'M/D'
+                                                    }
                                     except (ValueError, TypeError):
                                         pass
                         # 리스트인 경우
@@ -389,20 +654,47 @@ class JiraIntegration:
                             logger.info(f"🔄 리스트 필드: {field_key} = {field_value}")
                             for item in field_value:
                                 if isinstance(item, (int, float)) and item > 0:
-                                    logger.info(f"✅ Story Points 발견: {field_key} = {item}")
-                                    return float(item)
+                                    original_value = float(item)
+                                    if field_key == 'customfield_10124':
+                                        converted_value = original_value * 20
+                                        logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
+                                        return {
+                                            'story_points': converted_value,
+                                            'story_points_original': original_value,
+                                            'story_points_unit': 'M/M'
+                                        }
+                                    else:
+                                        logger.info(f"✅ Story Points 발견: {field_key} = {original_value} M/D")
+                                        return {
+                                            'story_points': original_value,
+                                            'story_points_original': original_value,
+                                            'story_points_unit': 'M/D'
+                                        }
                                 elif isinstance(item, str) and item.strip():
                                     try:
-                                        num_value = float(item)
-                                        if num_value > 0:
-                                            logger.info(f"✅ Story Points 발견: {field_key} = {item}")
-                                            return float(num_value)
+                                        original_value = float(item)
+                                        if original_value > 0:
+                                            if field_key == 'customfield_10124':
+                                                converted_value = original_value * 20
+                                                logger.info(f"✅ WORK 공수 발견: {original_value} M/M → {converted_value} M/D")
+                                                return {
+                                                    'story_points': converted_value,
+                                                    'story_points_original': original_value,
+                                                    'story_points_unit': 'M/M'
+                                                }
+                                            else:
+                                                logger.info(f"✅ Story Points 발견: {field_key} = {original_value} M/D")
+                                                return {
+                                                    'story_points': original_value,
+                                                    'story_points_original': original_value,
+                                                    'story_points_unit': 'M/D'
+                                                }
                                     except ValueError:
                                         pass
                         # None이 아닌 경우 (0도 포함)
                         elif field_value == 0:
                             logger.info(f"⚠️ Story Points가 0입니다: {field_key} = {field_value}")
-                            return 0.0
+                            return {'story_points': 0.0, 'story_points_original': 0.0, 'story_points_unit': 'M/D'}
                         else:
                             logger.info(f"⚠️ 예상치 못한 필드 타입: {field_key} = {field_value} (타입: {type(field_value).__name__})")
             
@@ -411,14 +703,20 @@ class JiraIntegration:
             for field_key, field_value in fields.items():
                 if 'customfield' in field_key and field_value is not None:
                     if isinstance(field_value, (int, float)) and 0.5 <= field_value <= 100:
-                        logger.info(f"✅ Story Points 후보 발견: {field_key} = {field_value}")
-                        return float(field_value)
+                        original_value = float(field_value)
+                        logger.info(f"✅ Story Points 후보 발견: {field_key} = {original_value}")
+                        # M/D로 가정
+                        return {
+                            'story_points': original_value,
+                            'story_points_original': original_value,
+                            'story_points_unit': 'M/D'
+                        }
             
             logger.info(f"⚠️ Story Points 필드를 찾을 수 없습니다.")
-            return 0.0
+            return {'story_points': 0.0, 'story_points_original': 0.0, 'story_points_unit': 'M/D'}
         except Exception as e:
             logger.error(f"❌ Story Points 추출 오류: {str(e)}")
-            return 0.0
+            return {'story_points': 0.0, 'story_points_original': 0.0, 'story_points_unit': 'M/D'}
     
     def _extract_reason_from_description(self, description: str) -> Optional[str]:
         """설명에서 산정 이유 추출"""
@@ -432,6 +730,117 @@ class JiraIntegration:
                 return f"설명에서 추출: {description[:100]}..."
         
         return None
+    
+    def _extract_comments(self, fields: Dict) -> Optional[str]:
+        """Jira 댓글 추출 및 병합"""
+        try:
+            comment_obj = fields.get('comment')
+            if not comment_obj:
+                return None
+            
+            comments = comment_obj.get('comments', [])
+            if not comments:
+                return None
+            
+            # 댓글들을 텍스트로 병합
+            comment_texts = []
+            for comment in comments:
+                try:
+                    # 작성자
+                    author = comment.get('author', {})
+                    author_name = 'Unknown'
+                    if isinstance(author, dict):
+                        author_name = author.get('displayName', author.get('name', 'Unknown'))
+                    
+                    # 댓글 본문 (ADF 형식일 수 있음)
+                    body = comment.get('body', '')
+                    
+                    # ADF(Atlassian Document Format) 형식인 경우 텍스트 추출
+                    if isinstance(body, dict):
+                        body_text = self._extract_text_from_adf(body)
+                    elif isinstance(body, str):
+                        body_text = body
+                    else:
+                        body_text = str(body)
+                    
+                    if body_text and body_text.strip():
+                        comment_texts.append(f"[{author_name}]: {body_text.strip()}")
+                
+                except Exception as comment_error:
+                    logger.warning(f"⚠️ 댓글 추출 중 오류: {str(comment_error)}")
+                    continue
+            
+            if comment_texts:
+                return " | ".join(comment_texts)
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"⚠️ 댓글 추출 오류: {str(e)}")
+            return None
+    
+    def _extract_text_from_adf(self, adf_content: Dict) -> str:
+        """ADF(Atlassian Document Format)에서 텍스트 추출 (panel 필터링 적용)"""
+        try:
+            texts = []
+            
+            def extract_text_recursive(node, skip_content=False):
+                if isinstance(node, dict):
+                    node_type = node.get('type', '')
+                    
+                    # panel 타입인 경우 panelType 확인
+                    if node_type == 'panel':
+                        attrs = node.get('attrs', {})
+                        panel_type = attrs.get('panelType', '')
+                        
+                        # panelType이 "error"이면 건너뜀 (n)
+                        if panel_type == 'error':
+                            logger.debug(f"⚠️ panel (error) 건너뜀")
+                            return  # 이 panel의 content는 무시
+                        
+                        # panelType이 "success"이면 포함 (/)
+                        elif panel_type == 'success':
+                            logger.debug(f"✅ panel (success) 포함")
+                            # content를 계속 처리
+                    
+                    # text 타입이면 텍스트 추출
+                    if not skip_content and node_type == 'text':
+                        text = node.get('text', '')
+                        if text:
+                            texts.append(text)
+                    
+                    # hardBreak를 줄바꿈으로 변환
+                    if not skip_content and node_type == 'hardBreak':
+                        texts.append('\n')
+                    
+                    # content가 있으면 재귀 탐색
+                    if 'content' in node and isinstance(node['content'], list):
+                        for child in node['content']:
+                            extract_text_recursive(child, skip_content)
+                    
+                    # 블록 요소 끝에 줄바꿈 추가
+                    if not skip_content and node_type in ['paragraph', 'listItem', 'heading', 'codeBlock', 'blockquote']:
+                        # 마지막 텍스트가 줄바꿈이 아니면 추가
+                        if texts and texts[-1] != '\n':
+                            texts.append('\n')
+                
+                elif isinstance(node, list):
+                    for item in node:
+                        extract_text_recursive(item, skip_content)
+            
+            extract_text_recursive(adf_content)
+            
+            # 텍스트 그대로 합치기 (줄바꿈 보존)
+            result = ''.join(texts)
+            
+            # 연속된 빈 줄 제거 (3개 이상의 연속 줄바꿈을 2개로)
+            result = re.sub(r'\n{3,}', '\n\n', result)
+            
+            return result.strip()
+            
+        except Exception as e:
+            logger.warning(f"⚠️ ADF 텍스트 추출 오류: {str(e)}")
+            return str(adf_content)
     
     def sync_ticket_data(self, ticket_key: str, major_category: str = None, minor_category: str = None, sub_category: str = None) -> dict:
         """특정 티켓 데이터 동기화"""

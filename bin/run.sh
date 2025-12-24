@@ -115,8 +115,10 @@ echo "📍 Cargo 경로: $(which cargo 2>/dev/null || echo 'NOT FOUND')"
 echo "📍 Python 경로: $(which python3)"
 echo "📍 PYTHONPATH: $PYTHONPATH"
 
-# 서버 시작
-nohup "$PYTHON_BIN" -m uvicorn "$APP_MODULE" --host 0.0.0.0 --port 9010 --log-level info --access-log 2>&1 >> "$LOG_FILE" &
+# 서버 시작 (백그라운드 실행, nohup)
+nohup "$PYTHON_BIN" -m uvicorn "$APP_MODULE" --host 0.0.0.0 --port 9010 --log-level info --access-log >> "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
-echo "✅ 서버 시작됨. PID: $(cat $PID_FILE)"
+
+echo "✅ 서버가 백그라운드로 시작되었습니다."
 echo "📝 로그 확인: tail -f $LOG_FILE"
+echo "🛑 서버 종료: kill \$(cat $PID_FILE)"

@@ -151,8 +151,8 @@ async def handle_slack_message(text: str, channel: str, thread_ts: str, message_
                 stats_message = f"""📊 *공수 산정 통계*
 
 • 총 데이터 수: {stats.get('total_estimations', 0)}개
-• 총 Story Points: {stats.get('total_story_points', 0)}점
-• 평균 Story Points: {stats.get('average_story_points', 0)}점"""
+• 총 Story Points: {stats.get('total_story_points', 0)}일
+• 평균 Story Points: {stats.get('average_story_points', 0)}일"""
                 post_slack_reply(channel, thread_ts, stats_message)
                 return
             except Exception as e:

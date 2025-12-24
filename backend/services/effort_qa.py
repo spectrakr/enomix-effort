@@ -18,12 +18,270 @@ from .effort_estimation import effort_manager
 
 logger = logging.getLogger(__name__)
 
+# Jira URL (Epic 링크 생성용)
+JIRA_BASE_URL = "https://enomix.atlassian.net/browse"
+
+def classify_task_phase(title: str) -> str:
+    """작업 제목을 기반으로 단계 분류
+    
+    Returns:
+        str: 'setup', 'analysis', 'implementation', 'test', 'deployment', 'etc'
+    """
+    title_lower = title.lower()
+    
+    # 1. 세팅 (환경, 설정, 구성 등)
+    setup_keywords = ['환경', '설정', '구성', '세팅', '자리', '준비', 'setup', 'config', 'configuration']
+    if any(keyword in title_lower for keyword in setup_keywords):
+        return 'setup'
+    
+    # 2. 분석/설계
+    analysis_keywords = ['분석', '설계', '요구사항', '기획', '상세업무', 'r&r', 'design', 'analysis', '검토']
+    if any(keyword in title_lower for keyword in analysis_keywords):
+        return 'analysis'
+    
+    # 3. 구현
+    implementation_keywords = ['개발', '구현', '코딩', '작업', '프로그램', 'api', '배치', 'i/f', '인터페이스', 'batch', 'implement', 'develop']
+    if any(keyword in title_lower for keyword in implementation_keywords):
+        return 'implementation'
+    
+    # 4. 테스트/모니터링
+    test_keywords = ['테스트', 'qa', '검증', '모니터링', '결과보완', 'test', 'verify', 'validation']
+    if any(keyword in title_lower for keyword in test_keywords):
+        return 'test'
+    
+    # 5. 반영/이행
+    deployment_keywords = ['반영', '이행', '배포', '적용', '릴리즈', 'deploy', 'release', '오픈']
+    if any(keyword in title_lower for keyword in deployment_keywords):
+        return 'deployment'
+    
+    # 6. 기타
+    return 'etc'
+
+def aggregate_epic_story_points(epic_keyword: str) -> dict:
+    """Epic 키워드로 하위 Task들을 검색하고 Story Points 집계"""
+    try:
+        logger.info(f"📊 Epic 집계 시작: '{epic_keyword}'")
+        
+        # Epic 키워드로 데이터 검색 (epic_key 또는 epic_name에 포함된 항목 찾기)
+        epic_keyword_lower = epic_keyword.lower()
+        matched_tasks = []
+        epic_groups = {}  # epic_key별로 그룹화
+        
+        # Epic 키워드를 토큰화 (공백 기준 분리)
+        keyword_tokens = epic_keyword_lower.split()
+        
+        for estimation in effort_manager.estimations:
+            # Epic 키워드가 epic_key, epic_name, 또는 title에 포함되어 있는지 확인
+            is_match = False
+            matched_field = ""
+            
+            # epic_key 매칭 (단순 부분 문자열)
+            if estimation.epic_key and epic_keyword_lower in estimation.epic_key.lower():
+                is_match = True
+                matched_field = "epic_key"
+            # epic_name 매칭 (토큰화 + 부분 문자열 모두 시도)
+            elif estimation.epic_name:
+                epic_name_lower = estimation.epic_name.lower()
+                # 1) 먼저 부분 문자열 매칭 시도
+                if epic_keyword_lower in epic_name_lower:
+                    is_match = True
+                    matched_field = "epic_name (exact)"
+                # 2) 토큰화 매칭: 모든 키워드 토큰이 포함되어 있으면 매칭
+                elif all(token in epic_name_lower for token in keyword_tokens):
+                    is_match = True
+                    matched_field = "epic_name (tokens)"
+            # title 매칭 (토큰화)
+            elif estimation.title:
+                title_lower = estimation.title.lower()
+                # 부분 문자열 또는 토큰 매칭
+                if epic_keyword_lower in title_lower or all(token in title_lower for token in keyword_tokens):
+                    is_match = True
+                    matched_field = "title"
+            
+            if is_match:
+                matched_tasks.append(estimation)
+                
+                # Epic별로 그룹화
+                epic_key = estimation.epic_key or "미지정"
+                if epic_key not in epic_groups:
+                    epic_groups[epic_key] = {
+                        "epic_key": epic_key,
+                        "epic_name": estimation.epic_name or "미지정",
+                        "tasks": [],
+                        "total_story_points": 0
+                    }
+                
+                # story_points가 None일 수 있으므로 0으로 처리
+                story_points = estimation.story_points if estimation.story_points is not None else 0
+                
+                # 작업 단계 분류
+                phase = classify_task_phase(estimation.title)
+                
+                epic_groups[epic_key]["tasks"].append({
+                    "jira_ticket": estimation.jira_ticket,
+                    "title": estimation.title,
+                    "story_points": story_points,
+                    "team_member": estimation.team_member,
+                    "phase": phase  # 단계 추가
+                })
+                epic_groups[epic_key]["total_story_points"] += story_points
+                
+                logger.info(f"  ✅ 매칭: {estimation.jira_ticket} - {estimation.title[:30]}... (필드: {matched_field})")
+        
+        if not matched_tasks:
+            logger.info(f"❌ Epic 키워드 '{epic_keyword}'와 일치하는 데이터 없음")
+            return None
+        
+        logger.info(f"✅ Epic 집계 완료: {len(matched_tasks)}개 Task, {len(epic_groups)}개 Epic")
+        return {
+            "epic_keyword": epic_keyword,
+            "total_tasks": len(matched_tasks),
+            "epic_groups": epic_groups,
+            "all_tasks": matched_tasks
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Epic 집계 오류: {str(e)}")
+        return None
+
 def run_effort_qa_chain(question: str) -> dict:
     """공수 산정 전용 QA 체인 실행"""
     try:
         logger.info(f"🔍 QA 체인 시작: '{question}'")
         
-        # 1. 먼저 긍정 피드백 데이터에서 검색
+        # 1. Epic 키워드 감지 및 집계 (프로젝트 전체 공수 질의)
+        epic_keywords = ['프로젝트', 'epic', '에픽', '전체 공수', '프로젝트 공수']
+        question_lower = question.lower()
+        is_epic_query = any(keyword in question_lower for keyword in epic_keywords)
+        
+        if is_epic_query:
+            logger.info(f"📊 Epic 질의 감지: '{question}'")
+            
+            # Epic 키워드 추출 (질문에서 프로젝트명 등 추출)
+            # 예: "도메인 추가 프로젝트 공수" -> "도메인"
+            epic_keyword = question_lower
+            for keyword in epic_keywords:
+                epic_keyword = epic_keyword.replace(keyword, '').strip()
+            
+            # 불필요한 단어 제거
+            stop_words = ['공수', '얼마', '알려줘', '알려주세요', '?', '？', '추가', '개선', '개발', '기능', '작업']
+            for stop_word in stop_words:
+                epic_keyword = epic_keyword.replace(stop_word, '').strip()
+            
+            logger.info(f"📊 추출된 Epic 키워드: '{epic_keyword}'")
+            
+            # Epic 집계 실행
+            if epic_keyword:
+                epic_result = aggregate_epic_story_points(epic_keyword)
+                
+                if epic_result:
+                    # Epic 집계 결과를 답변으로 포맷팅 (개선된 버전)
+                    answer_parts = [f"📌 '{epic_keyword}' 프로젝트 공수 집계 결과:\n"]
+                    
+                    for epic_key, epic_data in epic_result["epic_groups"].items():
+                        # 1. Epic 제목 + Jira 링크
+                        epic_link = f"{JIRA_BASE_URL}/{epic_data['epic_key']}"
+                        answer_parts.append(f"\n🔹 Epic: {epic_data['epic_name']}")
+                        answer_parts.append(f"   🔗 {epic_link}\n")
+                        
+                        # 2. 단계별 공수 분류
+                        phase_stats = {
+                            'setup': {'count': 0, 'points': 0, 'name': '🔧 세팅', 'order': 1},
+                            'analysis': {'count': 0, 'points': 0, 'name': '📋 분석/설계', 'order': 2},
+                            'implementation': {'count': 0, 'points': 0, 'name': '💻 구현', 'order': 3},
+                            'test': {'count': 0, 'points': 0, 'name': '🧪 테스트/모니터링', 'order': 4},
+                            'deployment': {'count': 0, 'points': 0, 'name': '🚀 반영/이행', 'order': 5},
+                            'etc': {'count': 0, 'points': 0, 'name': '📦 기타', 'order': 6}
+                        }
+                        
+                        # 각 작업을 단계별로 분류 + 담당자별로 집계
+                        member_stats = {}  # 담당자별 공수 집계
+                        
+                        for task in epic_data['tasks']:
+                            phase = task.get('phase', 'etc')
+                            phase_stats[phase]['count'] += 1
+                            phase_stats[phase]['points'] += task['story_points']
+                            
+                            # 담당자별 공수 집계
+                            member = task.get('team_member') or '미지정'
+                            if member not in member_stats:
+                                member_stats[member] = 0
+                            member_stats[member] += task['story_points']
+                        
+                        # 단계별 공수 출력 (공수가 있는 것만)
+                        answer_parts.append("📊 작업 단계별 공수:")
+                        total_points = 0
+                        total_count = 0
+                        
+                        # order 순서대로 정렬
+                        sorted_phases = sorted(phase_stats.items(), key=lambda x: x[1]['order'])
+                        
+                        for phase_key, stats in sorted_phases:
+                            if stats['count'] > 0:
+                                # 소수점 2자리까지 반올림
+                                points_rounded = round(stats['points'], 2)
+                                answer_parts.append(f"   {stats['name']}: {points_rounded}일 ({stats['count']}건)")
+                                total_points += stats['points']
+                                total_count += stats['count']
+                        
+                        # 총 공수도 소수점 2자리까지 반올림
+                        total_points_rounded = round(total_points, 2)
+                        answer_parts.append(f"   {'─' * 30}")
+                        answer_parts.append(f"   ✅ 총 공수: {total_points_rounded}일 ({total_count}건)\n")
+                        
+                        # 담당자별 공수 표시 (2명 이상일 때만)
+                        if len(member_stats) > 1 and '미지정' not in member_stats:
+                            answer_parts.append("👥 담당자별 공수:")
+                            for member, points in sorted(member_stats.items(), key=lambda x: -x[1]):
+                                if member != '미지정':
+                                    points_rounded = round(points, 2)
+                                    answer_parts.append(f"   • {member}: {points_rounded}일")
+                            answer_parts.append("")  # 빈 줄 추가
+                        
+                        # 3. LLM 요약 생성
+                        try:
+                            # 작업 제목만 추출 (담당자/공수 정보 제외)
+                            task_titles_only = [task['title'] for task in epic_data['tasks'][:20]]  # 최대 20개
+                            
+                            summary_prompt = f"""다음은 '{epic_data['epic_name']}' 프로젝트의 주요 작업 목록입니다. 이 프로젝트의 핵심 내용을 2-3문장으로 간단하게 요약해주세요.
+
+작업 목록:
+{chr(10).join(f'- {title}' for title in task_titles_only)}
+
+요약 (2-3문장, 프로젝트의 전반적인 내용과 주요 기능):"""
+                            
+                            llm = ChatOpenAI(model_name="gpt-4o-mini", temperature=0.3)
+                            summary = llm.invoke(summary_prompt).content.strip()
+                            
+                            answer_parts.append("💡 요약:")
+                            answer_parts.append(f"{summary}\n")
+                            
+                        except Exception as summary_error:
+                            logger.warning(f"⚠️ LLM 요약 생성 실패: {str(summary_error)}")
+                            # 요약 실패 시 단순 통계 정보 제공 (담당자 정보 제외)
+                            answer_parts.append("💡 요약:")
+                            answer_parts.append(f"총 {total_count}개 작업으로 구성된 프로젝트이며, 총 공수는 {total_points_rounded}일입니다.\n")
+                        
+                        # 4. 주요 작업 목록 (최대 10개)
+                        answer_parts.append("📝 주요 작업 목록:")
+                        for i, task in enumerate(epic_data['tasks'][:10], 1):
+                            phase_name = phase_stats.get(task.get('phase', 'etc'), {}).get('name', '📦')
+                            # 개별 작업 공수도 소수점 2자리까지 반올림
+                            task_points_rounded = round(task['story_points'], 2)
+                            member = task.get('team_member', '미지정')
+                            answer_parts.append(f"   {i}. [{task['jira_ticket']}] {task['title']}: {task_points_rounded}일 ({member})")
+                        
+                        if len(epic_data['tasks']) > 10:
+                            answer_parts.append(f"   ... 외 {len(epic_data['tasks']) - 10}개 작업")
+                    
+                    return {
+                        "question": question,
+                        "answer": "\n".join(answer_parts),
+                        "sources": [{"source": "Epic 집계", "page": "N/A", "content": f"{epic_result['total_tasks']}개 작업"}],
+                        "is_from_epic_aggregation": True
+                    }
+        
+        # 2. 긍정 피드백 데이터에서 검색
         feedback_result = search_positive_feedback(question)
         if feedback_result:
             logger.info(f"✅ 피드백 데이터에서 답변 발견: {feedback_result['question'][:50]}...")
@@ -389,6 +647,13 @@ def run_effort_qa_chain(question: str) -> dict:
                 logger.info(f"✅ 원본 질문 재검색 결과 사용 (문서: {len(source_docs)}개)")
         
         logger.info(f"✅ QA 체인 실행 완료. 답변 길이: {len(answer)}자, 참조 문서: {len(source_docs)}개")
+        
+        # 검색된 문서 목록 로깅 (디버깅용)
+        if source_docs:
+            logger.info("📄 검색된 문서 목록:")
+            for i, doc in enumerate(source_docs[:10], 1):  # 상위 10개만
+                content_preview = doc.page_content[:100].replace('\n', ' ')
+                logger.info(f"   {i}. {content_preview}...")
         
         # 참조 문서 정보 추출
         sources = []

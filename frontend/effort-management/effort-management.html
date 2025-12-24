@@ -38,6 +38,9 @@
           <div class="nav-item" data-tab="list" onclick="switchTab('list')">
             <span class="nav-text">데이터 목록</span>
           </div>
+          <div class="nav-item" data-tab="scheduler" onclick="switchTab('scheduler')">
+            <span class="nav-text">스케줄러 이력</span>
+          </div>
         </nav>
       </aside>
 
@@ -121,11 +124,32 @@
 
     <!-- Jira 가져오기 탭 -->
     <div id="sync" class="tab-content">
+      <!-- 완료된 Epic 자동 동기화 섹션 -->
+      <div class="section">
+        <h2>완료된 Epic 자동 동기화 (ENOMIX)</h2>
+        <div style="background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #4caf50;">
+          <strong>자동 검색 조건:</strong><br>
+          • 프로젝트: ENOMIX<br>
+          • 타입: Epic<br>
+          • 상태: 완료 (Done)<br>
+          • 담당자: 있음<br>
+          • 키워드: "구축" 포함<br><br>
+          <strong>동작:</strong> 위 조건에 맞는 모든 Epic을 자동으로 찾아서 하위 작업(Task, Story, Sub-task, Bug 등)을 동기화합니다<br>
+          <strong>참고:</strong> WORK 프로젝트는 수동 동기화를 사용하세요
+        </div>
+        
+        <button onclick="autoSyncCompletedEpics()" class="btn btn-success" style="font-size: 16px; padding: 12px 24px;">
+          🚀 완료된 Epic 자동 동기화 (ENOMIX)
+        </button>
+        <div id="autoSyncStatus" class="loading" style="display: none;">🔄 완료된 Epic을 검색하고 동기화 중입니다...</div>
+      </div>
+
       <!-- Epic 하위 작업 동기화 섹션 -->
       <div class="section">
-        <h2>Epic 하위 작업 일괄 가져오기</h2>
+        <h2>Epic 하위 작업 일괄 가져오기 (수동)</h2>
         <div style="background: #fff3e0; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #ff9800;">
-          <strong>Epic 하위 작업:</strong> Epic에 연결된 모든 Task 타입 작업을 일괄 가져옵니다<br>
+          <strong>Epic 하위 작업:</strong> 특정 Epic에 연결된 모든 하위 작업을 일괄 가져옵니다<br>
+          <strong>포함 타입:</strong> Task, Story, Sub-task, Bug 등 (Epic 제외)<br>
           <strong>카테고리:</strong> 가져온 후 데이터 목록에서 개별적으로 수정 가능합니다
         </div>
         
@@ -146,8 +170,8 @@
       <div class="section">
         <h2>개별 티켓 가져오기</h2>
         <div style="background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #2196f3;">
-          <strong>허용된 티켓 타입:</strong> 작업, 스토리, 버그, Story, Task, Bug<br>
-          <strong>제외된 타입:</strong> Epic, Sub-task 등
+          <strong>허용된 티켓 타입:</strong> 작업, 스토리, 버그, Story, Task, Bug, Sub-task 등<br>
+          <strong>제외된 타입:</strong> Epic (Epic은 Epic 동기화 메뉴 사용)
         </div>
         
         <div class="form-row">
@@ -224,6 +248,25 @@
         </div>
         
         <div id="effortListContent" class="loading">📋 데이터 목록을 로드 중입니다...</div>
+      </div>
+    </div>
+
+    <!-- 스케줄러 이력 탭 -->
+    <div id="scheduler" class="tab-content">
+      <div class="section">
+        <h2>스케줄러 실행 이력</h2>
+        <div style="background: #ffebee; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid #f44336;">
+          <strong>⚠️ 자동 스케줄러 비활성화</strong><br>
+          Python SSL 모듈 문제로 자동 스케줄러가 비활성화되었습니다.<br>
+          수동 동기화 버튼을 사용하여 Epic을 동기화해주세요.<br><br>
+          <strong>💡 이력 확인:</strong> 수동 실행 이력을 확인할 수 있습니다 (최근 100개)
+        </div>
+        
+        <button onclick="loadSchedulerHistory()" class="btn btn-primary" style="margin-bottom: 20px;">
+          🔄 이력 새로고침
+        </button>
+        
+        <div id="schedulerHistoryContent" class="loading">📋 스케줄러 이력을 로드 중입니다...</div>
       </div>
     </div>
         </div>

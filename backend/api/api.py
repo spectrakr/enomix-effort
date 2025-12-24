@@ -12,6 +12,7 @@ import re
 import shutil
 import logging
 import json
+import time
 from datetime import datetime
 
 
@@ -35,13 +36,14 @@ from ..services.category_classifier import auto_classify
 from slack_sdk.web.async_client import AsyncWebClient
 from ..services.effort_estimation import EffortEstimation, effort_manager
 from ..services.effort_qa import run_effort_qa_chain, run_effort_qa_with_feedback, get_effort_statistics, search_similar_features
-from ..data.database import get_vectordb, index_document
+from ..data.database import get_vectordb, index_document, index_json_data, index_json_data_incremental
 from ..services.jira_integration import create_jira_integration
 from ..services.mock_qa import mock_qa_response, mock_effort_qa_response
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from data.prompts import intent_prompt_manager
+# from apscheduler.schedulers.background import BackgroundScheduler  # SSL 문제로 임시 비활성화
 
 # Configure logging
 from ..utils.config import LOG_DIR
@@ -73,8 +75,23 @@ root_logger.addHandler(console_handler)
 logger = logging.getLogger(__name__)
 logger.info(f"📝 로그 파일 설정 완료: {log_file}")
 
+# 전역 동기화 상태 변수
+sync_status = {
+    "is_running": False,
+    "progress": 0,
+    "total_epics": 0,
+    "completed_epics": 0,
+    "failed_epics": 0,
+    "current_epic": "",
+    "message": "",
+    "failed_list": []
+}
+
 # Create FastAPI app
 app = FastAPI()
+
+# 스케줄러 초기화 (SSL 문제로 임시 비활성화)
+# scheduler = BackgroundScheduler()
 
 # 기존 관리자 페이지 제거됨
 
@@ -99,17 +116,65 @@ async def static_effort_redirect():
 @app.on_event("startup")
 async def startup_event():
     try:
-        logger.info("🚀 Server starting up...")
-        # 벡터 DB 기능 비활성화로 인덱싱 스킵
-        logger.info("📚 Startup indexing skipped (vector DB disabled)")
+        logger.info("=" * 80)
+        logger.info("🚀 서버 시작 중...")
+        logger.info("=" * 80)
+        
+        # 벡터 DB 색인 스킵 (동기화 시 증분 색인으로 처리)
+        logger.info("📚 [1/3] 벡터 DB 색인 확인...")
+        try:
+            json_file_path = os.path.join(DOCS_DIR, "effort_estimations.json")
+            if os.path.exists(json_file_path):
+                # JSON 파일 정보 확인
+                import json
+                with open(json_file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    total_items = len(data)
+                
+                logger.info(f"   📄 effort_estimations.json 파일 확인: {total_items}개 항목")
+                logger.info(f"   ℹ️ 색인은 Epic 동기화 시 자동으로 실행됩니다 (증분 색인)")
+                logger.info(f"   ℹ️ 수동 재색인이 필요하면 웹 UI에서 '데이터 재색인' 버튼 클릭")
+            else:
+                logger.warning("   ⚠️ effort_estimations.json 파일 없음")
+        except Exception as check_error:
+            logger.error(f"   ❌ 파일 확인 실패: {str(check_error)}")
         
         # 카테고리 자동 마이그레이션
+        logger.info("📂 [2/3] 카테고리 자동 마이그레이션 중...")
         await auto_migrate_categories()
+        logger.info("   ✅ 카테고리 마이그레이션 완료")
+        
+        # Epic 자동 동기화 스케줄러 시작 (SSL 문제로 임시 비활성화)
+        logger.info("⏰ [3/3] 스케줄러 설정 중...")
+        # scheduler.add_job(
+        #     sync_completed_epics_background,
+        #     'cron',
+        #     hour=3,
+        #     minute=0,
+        #     id='auto_sync_completed_epics',
+        #     replace_existing=True
+        # )
+        # scheduler.start()
+        logger.info("   ⚠️ Epic 자동 동기화 스케줄러 비활성화 (SSL 문제)")
+        logger.info("   ℹ️ 수동 실행만 가능합니다")
+        
+        logger.info("=" * 80)
+        logger.info("✅ 서버 기동 완료! 🎉")
+        logger.info("=" * 80)
         
     except Exception as e:
         import traceback
         traceback.print_exc()
         logger.error(f"❌ Error during startup: {str(e)}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """서버 종료 시 스케줄러 정리"""
+    try:
+        # scheduler.shutdown()  # SSL 문제로 임시 비활성화
+        logger.info("✅ 서버 종료 완료")
+    except Exception as e:
+        logger.error(f"❌ 서버 종료 오류: {str(e)}")
 
 async def auto_migrate_categories():
     """카테고리 변경 시 자동 마이그레이션"""
@@ -1002,9 +1067,18 @@ async def list_effort_estimations(
         for i, estimation in enumerate(paginated_estimations):
             estimation.sequence_number = start_index + i + 1
         
+        # 데이터 목록용: description과 comments 제외 (응답 크기 축소)
+        estimations_data = []
+        for estimation in paginated_estimations:
+            est_dict = estimation.__dict__.copy()
+            # description과 comments 제외 (긴 텍스트)
+            est_dict.pop('description', None)
+            est_dict.pop('comments', None)
+            estimations_data.append(est_dict)
+        
         jira_url = os.getenv('JIRA_URL', 'https://enomix.atlassian.net')
         return {
-            "estimations": [estimation.__dict__ for estimation in paginated_estimations],
+            "estimations": estimations_data,
             "jira_url": jira_url,
             "pagination": {
                 "current_page": page,
@@ -1252,27 +1326,38 @@ async def update_effort_category(request: Request):
 
 @app.delete("/effort/delete/{jira_ticket}")
 async def delete_effort_estimation(jira_ticket: str):
-    """공수 산정 데이터 삭제"""
-    try:
-        from ..services.effort_estimation import effort_manager
-        
-        # 해당 티켓이 존재하는지 확인
-        estimation = effort_manager.get_estimation_by_ticket(jira_ticket)
-        if not estimation:
-            return JSONResponse(status_code=404, content={"error": "해당 티켓을 찾을 수 없습니다"})
-        
-        # 삭제 실행
-        success = effort_manager.delete_estimation(jira_ticket)
-        
-        if success:
-            logger.info(f"✅ 공수 산정 데이터 삭제 완료: {jira_ticket}")
-            return {"message": "데이터가 삭제되었습니다"}
-        else:
-            logger.error(f"❌ 공수 산정 데이터 삭제 실패: {jira_ticket}")
-            return JSONResponse(status_code=500, content={"error": "삭제 중 오류가 발생했습니다"})
-    except Exception as e:
-        logger.error(f"❌ 공수 산정 데이터 삭제 오류: {str(e)}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    """공수 산정 데이터 삭제 (비활성화됨 - 데이터 보호)"""
+    # 데이터 보호를 위해 삭제 기능 비활성화
+    logger.warning(f"⚠️ 삭제 시도 차단: {jira_ticket} (삭제 기능 비활성화됨)")
+    return JSONResponse(
+        status_code=403, 
+        content={
+            "error": "데이터 보호를 위해 삭제 기능이 비활성화되었습니다",
+            "message": "잘못된 데이터는 수정 기능을 사용하거나 관리자에게 문의하세요"
+        }
+    )
+    
+    # 원본 코드 (필요시 주석 해제)
+    # try:
+    #     from ..services.effort_estimation import effort_manager
+    #     
+    #     # 해당 티켓이 존재하는지 확인
+    #     estimation = effort_manager.get_estimation_by_ticket(jira_ticket)
+    #     if not estimation:
+    #         return JSONResponse(status_code=404, content={"error": "해당 티켓을 찾을 수 없습니다"})
+    #     
+    #     # 삭제 실행
+    #     success = effort_manager.delete_estimation(jira_ticket)
+    #     
+    #     if success:
+    #         logger.info(f"✅ 공수 산정 데이터 삭제 완료: {jira_ticket}")
+    #         return {"message": "데이터가 삭제되었습니다"}
+    #     else:
+    #         logger.error(f"❌ 공수 산정 데이터 삭제 실패: {jira_ticket}")
+    #         return JSONResponse(status_code=500, content={"error": "삭제 중 오류가 발생했습니다"})
+    # except Exception as e:
+    #     logger.error(f"❌ 공수 산정 데이터 삭제 오류: {str(e)}")
+    #     return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/effort/sync-epic/")
 async def sync_epic_data(request: Request):
@@ -1280,6 +1365,11 @@ async def sync_epic_data(request: Request):
     try:
         # 요청 데이터 로깅
         logger.info(f"🔄 Epic 동기화 요청 수신 시작")
+        
+        # 동기화 전 데이터 백업
+        from ..services.effort_estimation import effort_manager
+        logger.info("💾 동기화 시작 전 데이터 백업 중...")
+        effort_manager.backup_data()
         
         # Content-Type 확인
         content_type = request.headers.get("content-type", "")
@@ -1305,6 +1395,14 @@ async def sync_epic_data(request: Request):
             logger.error("❌ Jira 설정이 없습니다")
             return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
         
+        # Epic 기본 정보 조회 (Epic 이름 가져오기)
+        epic_info = jira.test_epic_basic_info(epic_key)
+        epic_name = "알 수 없음"
+        if epic_info and isinstance(epic_info, dict):
+            fields = epic_info.get('fields', {})
+            epic_name = fields.get('summary', epic_key) if fields else epic_key
+        logger.info(f"🔄 Epic 정보: {epic_key} - {epic_name}")
+        
         # Epic 하위 작업 조회
         subtasks_result = jira.test_epic_subtasks(epic_key)
         if not subtasks_result or not subtasks_result.get("success"):
@@ -1312,12 +1410,14 @@ async def sync_epic_data(request: Request):
             logger.error(f"❌ Epic 하위 작업 조회 실패: {epic_key} - {error_msg}")
             return JSONResponse(status_code=404, content={"error": f"Epic '{epic_key}'의 하위 작업을 찾을 수 없습니다: {error_msg}"})
         
-        # 작업 타입 필터링 (작업만)
+        # 작업 타입 필터링 (Epic만 제외하고 모든 타입 허용)
         tasks = subtasks_result.get("subtasks", [])
-        filtered_tasks = [task for task in tasks if task.get("issue_type") == "작업"]
+        excluded_types = ['Epic', '에픽']  # Epic 자체만 제외
+        filtered_tasks = [task for task in tasks if task.get("issue_type") not in excluded_types]
         
         logger.info(f"🔄 작업 타입 필터링: 총 {len(tasks)}개 → {len(filtered_tasks)}개")
         logger.info(f"🔄 실제 타입들: {[task.get('issue_type') for task in tasks[:10]]}")  # 처음 10개만 로깅
+        logger.info(f"🔄 제외된 타입: {excluded_types}")
         
         # 제목 필터링 (선택사항)
         if title_filter:
@@ -1325,10 +1425,10 @@ async def sync_epic_data(request: Request):
             filtered_tasks = [task for task in filtered_tasks if title_filter.lower() in task.get("summary", "").lower()]
             logger.info(f"🔄 제목 필터링: '{title_filter}' - {original_count}개 → {len(filtered_tasks)}개")
         
-        logger.info(f"🔄 Epic '{epic_key}' 하위 작업: 총 {len(tasks)}개, 작업 타입 {len(filtered_tasks)}개")
+        logger.info(f"🔄 Epic '{epic_key}' 하위 작업: 총 {len(tasks)}개, 필터링 후 {len(filtered_tasks)}개")
         
         if not filtered_tasks:
-            return JSONResponse(status_code=404, content={"error": f"Epic '{epic_key}'에 작업 타입의 하위 작업이 없습니다"})
+            return JSONResponse(status_code=404, content={"error": f"Epic '{epic_key}'에 하위 작업이 없거나 모두 Epic 타입입니다"})
         
         # 각 작업을 공수 산정 데이터로 변환
         from ..services.effort_estimation import effort_manager
@@ -1343,38 +1443,63 @@ async def sync_epic_data(request: Request):
                 existing = effort_manager.get_estimation_by_ticket(task["key"])
                 
                 if existing:
-                    # 기존 데이터 업데이트
+                    # 기존 데이터 업데이트 (카테고리)
                     effort_manager.update_estimation_category(
                         task["key"], 
                         major_category or existing.major_category or "",
                         minor_category or existing.minor_category or "",
                         sub_category or existing.sub_category or ""
                     )
+                    # Epic 정보 업데이트
+                    effort_manager.update_estimation_epic(
+                        task["key"],
+                        epic_key,
+                        epic_name
+                    )
                     updated_count += 1
-                    logger.info(f"✅ 기존 데이터 업데이트: {task['key']}")
+                    logger.info(f"✅ 기존 데이터 업데이트: {task['key']} (Epic: {epic_key})")
                 else:
-                    # 새 데이터 추가
+                    # 새 데이터 추가 (description 포함, comments만 제외)
                     from ..services.effort_estimation import EffortEstimation
                     
                     new_estimation = EffortEstimation(
                         jira_ticket=task["key"],
                         title=task["summary"],
                         story_points=task.get("story_points", 0),
-                        description=task.get("description", ""),
+                        description=task.get("description", None),  # description 포함
+                        comments=None,  # comments만 제외
                         team_member=task.get("assignee", ""),
                         estimation_reason="Epic 하위 작업 자동 동기화",
                         major_category=major_category or "",
                         minor_category=minor_category or "",
-                        sub_category=sub_category or ""
+                        sub_category=sub_category or "",
+                        epic_key=epic_key,
+                        epic_name=epic_name,
+                        story_points_original=task.get("story_points_original"),
+                        story_points_unit=task.get("story_points_unit", "M/D")
                     )
                     
                     effort_manager.add_estimation(new_estimation)
                     added_count += 1
-                    logger.info(f"✅ 새 데이터 추가: {task['key']}")
+                    logger.info(f"✅ 새 데이터 추가: {task['key']} (Epic: {epic_key})")
                     
             except Exception as e:
                 logger.error(f"❌ 작업 처리 실패 {task['key']}: {str(e)}")
                 skipped_count += 1
+        
+        # Epic 동기화 완료 후 증분 색인은 별도 배치로 실행 (속도 개선)
+        # if added_count > 0 or updated_count > 0:
+        #     logger.info("🔄 Epic 동기화 후 증분 색인 시작")
+        #     try:
+        #         # 추가/수정된 티켓 목록 수집
+        #         synced_tickets = [task["key"] for task in filtered_tasks]
+        #         
+        #         if synced_tickets:
+        #             json_file_path = os.path.join(DOCS_DIR, "effort_estimations.json")
+        #             index_json_data_incremental(synced_tickets, json_file_path)
+        #             logger.info(f"✅ Epic 동기화 후 증분 색인 완료: {len(synced_tickets)}개 티켓")
+        #     except Exception as reindex_error:
+        #         logger.warning(f"⚠️ Epic 동기화 후 증분 색인 실패 (무시하고 계속): {str(reindex_error)}")
         
         result = {
             "success": True,
@@ -1384,7 +1509,7 @@ async def sync_epic_data(request: Request):
             "updated_tasks": updated_count,
             "skipped_tasks": skipped_count,
             "jql_used": subtasks_result.get("jql_used", "알 수 없음"),
-            "message": f"Epic '{epic_key}' 하위 작업 동기화 완료"
+            "message": f"Epic '{epic_key}' 하위 작업 동기화 완료 (색인은 '데이터 재색인' 버튼으로 별도 실행)"
         }
         
         logger.info(f"✅ Epic 동기화 완료: {result}")
@@ -1392,6 +1517,295 @@ async def sync_epic_data(request: Request):
         
     except Exception as e:
         logger.error(f"❌ Epic 동기화 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+def save_scheduler_history(scheduler_name: str, status: str, details: dict, start_time=None, end_time=None):
+    """스케줄러 실행 이력 저장 (성공/실패만 기록, 실행중은 제외)"""
+    try:
+        # "running" 상태는 저장하지 않음
+        if status == "running":
+            return
+        
+        history_file = os.path.join(DOCS_DIR, "scheduler_history.json")
+        
+        # 기존 이력 로드
+        history = []
+        if os.path.exists(history_file):
+            with open(history_file, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+        
+        # 새 이력 추가
+        history.append({
+            "scheduler_name": scheduler_name,
+            "status": status,  # "success" or "failed"
+            "start_time": start_time.isoformat() if start_time else datetime.now().isoformat(),
+            "end_time": end_time.isoformat() if end_time else datetime.now().isoformat(),
+            "details": details
+        })
+        
+        # 최근 100개만 유지
+        history = history[-100:]
+        
+        # 저장
+        with open(history_file, 'w', encoding='utf-8') as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        
+        logger.info(f"✅ 스케줄러 이력 저장: {scheduler_name} - {status}")
+        
+    except Exception as e:
+        logger.error(f"❌ 스케줄러 이력 저장 오류: {str(e)}")
+
+def sync_completed_epics_background():
+    """완료된 Epic 자동 동기화 백그라운드 작업 (ENOMIX 프로젝트만)"""
+    global sync_status
+    
+    start_time = datetime.now()
+    
+    try:
+        logger.info(f"🔄 완료된 Epic 자동 동기화 백그라운드 작업 시작 (ENOMIX 프로젝트)")
+        
+        # 동기화 전 데이터 백업
+        from ..services.effort_estimation import effort_manager
+        logger.info("💾 동기화 시작 전 데이터 백업 중...")
+        effort_manager.backup_data()
+        
+        # 상태 초기화
+        sync_status["is_running"] = True
+        sync_status["progress"] = 0
+        sync_status["completed_epics"] = 0
+        sync_status["failed_epics"] = 0
+        sync_status["current_epic"] = ""
+        sync_status["message"] = f"Jira에서 완료된 Epic 검색 중 (ENOMIX 프로젝트)..."
+        sync_status["failed_list"] = []
+        
+        jira = create_jira_integration()
+        if not jira:
+            sync_status["is_running"] = False
+            sync_status["message"] = "Jira 설정이 없습니다"
+            logger.error("❌ Jira 설정이 없습니다")
+            return
+        
+        # ENOMIX는 기본 필드만 (빠름)
+        include_details = False
+        
+        # 1. 완료된 Epic 목록 조회 (ENOMIX만)
+        completed_epics = jira.search_completed_epics()
+        
+        if not completed_epics:
+            sync_status["is_running"] = False
+            sync_status["message"] = "완료된 Epic이 없습니다"
+            sync_status["progress"] = 100
+            logger.info("ℹ️ 완료된 Epic이 없습니다")
+            return
+        
+        sync_status["total_epics"] = len(completed_epics)
+        sync_status["message"] = f"{len(completed_epics)}개 Epic 동기화 시작"
+        logger.info(f"🔍 완료된 Epic {len(completed_epics)}개 발견")
+        
+        # 2. 각 Epic 동기화
+        for idx, epic in enumerate(completed_epics, 1):
+            epic_key = epic['key']
+            
+            try:
+                sync_status["current_epic"] = f"{epic_key} - {epic['summary'][:30]}..."
+                sync_status["message"] = f"동기화 중: {epic_key} ({idx}/{len(completed_epics)})"
+                logger.info(f"🔄 Epic 동기화 중: {epic_key} - {epic['summary'][:50]}...")
+                
+                # Epic 정보 조회
+                epic_info = jira.test_epic_basic_info(epic_key)
+                epic_name = "알 수 없음"
+                if epic_info and isinstance(epic_info, dict):
+                    fields = epic_info.get('fields', {})
+                    epic_name = fields.get('summary', epic_key) if fields else epic_key
+                
+                # Epic 하위 작업 조회 (프로젝트별로 상세 정보 포함 여부 결정)
+                subtasks_result = jira.test_epic_subtasks(epic_key, include_details=include_details)
+                if not subtasks_result or not subtasks_result.get("success"):
+                    logger.warning(f"⚠️ Epic {epic_key} 하위 작업 없음")
+                    sync_status["failed_epics"] += 1
+                    sync_status["failed_list"].append(f"{epic_key} (하위 작업 없음)")
+                    continue
+                
+                # 작업 타입 필터링 (Epic만 제외하고 모든 타입 허용)
+                tasks = subtasks_result.get("subtasks", [])
+                excluded_types = ['Epic', '에픽']  # Epic 자체만 제외
+                filtered_tasks = [task for task in tasks if task.get("issue_type") not in excluded_types]
+                
+                if not filtered_tasks:
+                    logger.warning(f"⚠️ Epic {epic_key} 하위 작업 없음 (Epic 타입만 있음)")
+                    sync_status["failed_epics"] += 1
+                    sync_status["failed_list"].append(f"{epic_key} (하위 작업 없음)")
+                    continue
+                
+                # 각 작업을 공수 산정 데이터로 변환
+                from ..services.effort_estimation import effort_manager, EffortEstimation
+                
+                task_added = 0
+                task_updated = 0
+                
+                for task in filtered_tasks:
+                    try:
+                        existing = effort_manager.get_estimation_by_ticket(task["key"])
+                        
+                        if existing:
+                            # 기존 데이터 Epic 정보 업데이트
+                            effort_manager.update_estimation_epic(task["key"], epic_key, epic_name)
+                            task_updated += 1
+                        else:
+                            # 새 데이터 추가 (description 포함, comments만 제외)
+                            new_estimation = EffortEstimation(
+                                jira_ticket=task["key"],
+                                title=task["summary"],
+                                story_points=task.get("story_points", 0),
+                                description=task.get("description", None),  # description 포함
+                                comments=None,  # comments만 제외
+                                team_member=task.get("assignee", ""),
+                                estimation_reason="완료된 Epic 자동 동기화",
+                                major_category="",
+                                minor_category="",
+                                sub_category="",
+                                epic_key=epic_key,
+                                epic_name=epic_name,
+                                story_points_original=task.get("story_points_original"),
+                                story_points_unit=task.get("story_points_unit", "M/D")
+                            )
+                            effort_manager.add_estimation(new_estimation)
+                            task_added += 1
+                            
+                    except Exception as task_error:
+                        logger.error(f"❌ Task {task['key']} 처리 실패: {str(task_error)}")
+                        continue
+                
+                logger.info(f"✅ Epic {epic_key} 동기화 완료: {task_added}개 추가, {task_updated}개 업데이트")
+                
+                # 증분 색인은 별도 배치 작업으로 실행 (속도 개선)
+                # if task_added > 0 or task_updated > 0:
+                #     try:
+                #         synced_tickets = [task["key"] for task in filtered_tasks]
+                #         json_file_path = os.path.join(DOCS_DIR, "effort_estimations.json")
+                #         index_json_data_incremental(synced_tickets, json_file_path)
+                #         logger.info(f"   ✅ 증분 색인 완료: {len(synced_tickets)}개 티켓")
+                #     except Exception as index_error:
+                #         logger.warning(f"   ⚠️ 증분 색인 실패 (무시하고 계속): {str(index_error)}")
+                
+                sync_status["completed_epics"] += 1
+                
+            except Exception as epic_error:
+                logger.error(f"❌ Epic {epic_key} 동기화 실패: {str(epic_error)}")
+                sync_status["failed_epics"] += 1
+                sync_status["failed_list"].append(f"{epic_key} ({str(epic_error)})")
+                continue
+            
+            # 진행률 업데이트
+            sync_status["progress"] = int((idx / len(completed_epics)) * 100)
+        
+        # 완료 - 색인은 별도 배치 작업으로 실행
+        sync_status["is_running"] = False
+        sync_status["progress"] = 100
+        sync_status["current_epic"] = ""
+        sync_status["message"] = f"동기화 완료: {sync_status['completed_epics']}개 성공, {sync_status['failed_epics']}개 실패 (색인은 별도 실행 필요)"
+        logger.info(f"✅ 완료된 Epic 자동 동기화 완료: {sync_status['message']}")
+        logger.info(f"💡 벡터 DB 색인은 '데이터 재색인' 버튼으로 별도 실행하세요")
+        
+        # 성공 이력 저장
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        save_scheduler_history(
+            "Epic 자동 동기화",
+            "success",
+            {
+                "total_epics": sync_status["total_epics"],
+                "completed_epics": sync_status["completed_epics"],
+                "failed_epics": sync_status["failed_epics"],
+                "failed_list": sync_status["failed_list"],
+                "duration_seconds": duration,
+                "message": sync_status["message"]
+            },
+            start_time=start_time,
+            end_time=end_time
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ 완료된 Epic 자동 동기화 오류: {str(e)}")
+        sync_status["is_running"] = False
+        sync_status["message"] = f"오류 발생: {str(e)}"
+        
+        # 실패 이력 저장
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        save_scheduler_history(
+            "Epic 자동 동기화",
+            "failed",
+            {
+                "error": str(e),
+                "duration_seconds": duration,
+                "message": sync_status["message"]
+            },
+            start_time=start_time,
+            end_time=end_time
+        )
+
+@app.post("/effort/auto-sync-completed-epics/")
+async def auto_sync_completed_epics(background_tasks: BackgroundTasks):
+    """완료된 Epic 자동 동기화 시작 (백그라운드, ENOMIX 프로젝트만)"""
+    global sync_status
+    
+    # 이미 실행 중인지 확인
+    if sync_status["is_running"]:
+        return {
+            "success": False,
+            "message": "이미 동기화가 진행 중입니다",
+            "is_running": True
+        }
+    
+    # Jira 설정 확인
+    jira = create_jira_integration()
+    if not jira:
+        return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+    
+    logger.info(f"🔄 완료된 Epic 자동 동기화 시작: ENOMIX 프로젝트")
+    
+    # 백그라운드 작업 등록
+    background_tasks.add_task(sync_completed_epics_background)
+    
+    return {
+        "success": True,
+        "message": "완료된 Epic 자동 동기화가 시작되었습니다 (ENOMIX). 백그라운드에서 진행됩니다.",
+        "is_running": True
+    }
+
+@app.get("/effort/sync-status/")
+async def get_sync_status():
+    """동기화 상태 조회"""
+    return sync_status
+
+@app.get("/effort/scheduler-history/")
+async def get_scheduler_history():
+    """스케줄러 실행 이력 조회"""
+    try:
+        history_file = os.path.join(DOCS_DIR, "scheduler_history.json")
+        
+        if not os.path.exists(history_file):
+            return {
+                "success": True,
+                "history": [],
+                "message": "스케줄러 실행 이력이 없습니다"
+            }
+        
+        with open(history_file, 'r', encoding='utf-8') as f:
+            history = json.load(f)
+        
+        # 최신 순으로 정렬
+        history.reverse()
+        
+        return {
+            "success": True,
+            "history": history,
+            "total": len(history)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 스케줄러 이력 조회 오류: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ==================== 프롬프트 관리 엔드포인트 ====================
@@ -1605,6 +2019,53 @@ async def test_jira_connection():
             "error": str(e),
             "message": "Jira 연결 테스트 중 오류 발생"
         }
+
+@app.get("/test/issue-all-fields/{ticket_key}")
+async def test_issue_all_fields(ticket_key: str):
+    """티켓의 모든 필드 조회 (디버깅용)"""
+    try:
+        logger.info(f"🔍 티켓 전체 필드 조회: {ticket_key}")
+        
+        jira = create_jira_integration()
+        if not jira:
+            return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+        
+        # API v3로 모든 필드 조회
+        url = f"{jira.jira_url}/rest/api/3/issue/{ticket_key}"
+        
+        logger.info(f"🔄 Jira API 호출: {url}")
+        response = jira.session.get(url)  # 필드 제한 없음 (모든 필드)
+        
+        if response.status_code == 200:
+            data = response.json()
+            fields = data.get('fields', {})
+            
+            # customfield만 추출
+            custom_fields = {}
+            for key, value in fields.items():
+                if key.startswith('customfield_'):
+                    custom_fields[key] = {
+                        'value': value,
+                        'type': type(value).__name__
+                    }
+            
+            return {
+                "success": True,
+                "ticket_key": ticket_key,
+                "total_fields": len(fields),
+                "total_custom_fields": len(custom_fields),
+                "custom_fields": custom_fields,
+                "all_fields": fields  # 모든 필드 포함
+            }
+        else:
+            return JSONResponse(
+                status_code=response.status_code, 
+                content={"error": f"Jira API 오류: {response.text}"}
+            )
+            
+    except Exception as e:
+        logger.error(f"❌ 티켓 조회 오류: {str(e)}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/test/epic-subtasks/{epic_key}")
 async def test_epic_subtasks(epic_key: str):
@@ -1822,6 +2283,98 @@ async def test_epic_info(epic_key: str):
     except Exception as e:
         logger.error(f"❌ Epic 정보 조회 API 오류: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e), "details": "서버 내부 오류가 발생했습니다."})
+
+@app.get("/test/epic-full-details/{epic_key}")
+async def test_epic_full_details(epic_key: str):
+    """Epic의 모든 필드와 링크 정보 조회 (상세 디버깅용)"""
+    try:
+        jira = create_jira_integration()
+        if not jira:
+            return JSONResponse(status_code=400, content={"error": "Jira 설정이 필요합니다"})
+        
+        logger.info(f"🔍 Epic 상세 정보 조회: {epic_key}")
+        
+        # 1. Epic 자체의 모든 필드 조회
+        issue_url = f"{jira.jira_url}/rest/api/3/issue/{epic_key}"
+        params = {'expand': 'names,schema,operations,changelog'}
+        
+        epic_response = jira.session.get(issue_url, params=params)
+        epic_data = epic_response.json() if epic_response.status_code == 200 else {"error": epic_response.text}
+        
+        # 2. Epic의 링크된 이슈들 조회
+        links_url = f"{jira.jira_url}/rest/api/3/issue/{epic_key}?fields=issuelinks"
+        links_response = jira.session.get(links_url)
+        links_data = links_response.json() if links_response.status_code == 200 else {"error": links_response.text}
+        
+        # 3. Epic을 parent로 하는 하위 이슈 검색
+        search_url = f"{jira.jira_url}/rest/api/3/search/jql"
+        parent_jql = f'parent = {epic_key}'
+        parent_params = {
+            'jql': parent_jql,
+            'maxResults': 50,
+            'fields': 'key,summary,issuetype,parent'
+        }
+        parent_response = jira.session.get(search_url, params=parent_params)
+        parent_data = parent_response.json() if parent_response.status_code == 200 else {"error": parent_response.text}
+        
+        # 4. Epic Link 필드로 연결된 이슈 검색
+        epiclink_jql = f'"Epic Link" = {epic_key}'
+        epiclink_params = {
+            'jql': epiclink_jql,
+            'maxResults': 50,
+            'fields': 'key,summary,issuetype,customfield_10014,customfield_10015'
+        }
+        epiclink_response = jira.session.get(search_url, params=epiclink_params)
+        epiclink_data = epiclink_response.json() if epiclink_response.status_code == 200 else {"error": epiclink_response.text}
+        
+        # 5. 모든 커스텀 필드 중 Epic 관련 필드 찾기
+        fields_url = f"{jira.jira_url}/rest/api/3/field"
+        fields_response = jira.session.get(fields_url)
+        all_fields = fields_response.json() if fields_response.status_code == 200 else []
+        
+        epic_related_fields = []
+        if isinstance(all_fields, list):
+            for field in all_fields:
+                field_name = field.get('name', '').lower()
+                if 'epic' in field_name or 'parent' in field_name:
+                    epic_related_fields.append({
+                        'id': field.get('id'),
+                        'name': field.get('name'),
+                        'type': field.get('schema', {}).get('type', 'N/A')
+                    })
+        
+        return {
+            "success": True,
+            "epic_key": epic_key,
+            "epic_full_data": epic_data,
+            "linked_issues": links_data,
+            "parent_search_result": {
+                "jql": parent_jql,
+                "total": parent_data.get("total", 0) if isinstance(parent_data, dict) else 0,
+                "issues": parent_data.get("issues", []) if isinstance(parent_data, dict) else []
+            },
+            "epiclink_search_result": {
+                "jql": epiclink_jql,
+                "total": epiclink_data.get("total", 0) if isinstance(epiclink_data, dict) else 0,
+                "issues": epiclink_data.get("issues", []) if isinstance(epiclink_data, dict) else []
+            },
+            "epic_related_fields": epic_related_fields,
+            "response_codes": {
+                "epic": epic_response.status_code,
+                "links": links_response.status_code,
+                "parent_search": parent_response.status_code,
+                "epiclink_search": epiclink_response.status_code,
+                "fields": fields_response.status_code
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Epic 상세 정보 조회 오류: {str(e)}")
+        import traceback
+        return JSONResponse(status_code=500, content={
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        })
 
 @app.post("/feedback/")
 async def collect_feedback(request: Request):
@@ -2146,26 +2699,44 @@ async def save_positive_feedback(request: Request):
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/effort/reindex-json/")
-async def reindex_json_data():
-    """JSON 파일 강제 재인덱싱"""
+async def reindex_json_data(background_tasks: BackgroundTasks):
+    """JSON 파일 강제 재인덱싱 (백그라운드 실행)"""
     try:
         json_file_path = os.path.join(DOCS_DIR, "effort_estimations.json")
         if not os.path.exists(json_file_path):
             return JSONResponse(status_code=404, content={"error": "effort_estimations.json 파일을 찾을 수 없습니다"})
         
-        logger.info("🔄 JSON 파일 강제 재인덱싱 시작")
-        result = index_json_data(json_file_path, force=True)
+        # 백그라운드로 재인덱싱 실행
+        background_tasks.add_task(reindex_json_background, json_file_path)
         
-        if result:
-            logger.info("✅ JSON 파일 재인덱싱 완료")
-            return {"status": "success", "message": "JSON 파일이 성공적으로 재인덱싱되었습니다"}
-        else:
-            logger.error("❌ JSON 파일 재인덱싱 실패")
-            return JSONResponse(status_code=500, content={"error": "JSON 파일 재인덱싱에 실패했습니다"})
+        logger.info("🔄 JSON 파일 재인덱싱 백그라운드 작업 시작")
+        return {
+            "status": "started", 
+            "message": "재인덱싱이 백그라운드에서 시작되었습니다. 완료까지 수 분 소요될 수 있습니다."
+        }
         
     except Exception as e:
         logger.error(f"❌ JSON 파일 재인덱싱 오류: {str(e)}")
         return JSONResponse(status_code=500, content={"error": str(e)})
+
+def reindex_json_background(json_file_path: str):
+    """재인덱싱 백그라운드 작업"""
+    try:
+        logger.info("📚 백그라운드 재인덱싱 시작...")
+        start_time = time.time()
+        
+        result = index_json_data(json_file_path, force=True)
+        
+        elapsed = time.time() - start_time
+        if result:
+            logger.info(f"✅ 백그라운드 재인덱싱 완료 (소요 시간: {elapsed:.1f}초)")
+        else:
+            logger.error(f"❌ 백그라운드 재인덱싱 실패 (소요 시간: {elapsed:.1f}초)")
+            
+    except Exception as e:
+        logger.error(f"❌ 백그라운드 재인덱싱 오류: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 # StaticFiles 마운트 - API 라우트들 뒤에 배치
 app.mount("/effort-management", StaticFiles(directory=os.path.join(STATIC_DIR, "effort-management")), name="effort-management")

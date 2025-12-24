@@ -956,8 +956,113 @@ def search_positive_feedback(question):
         logger.warning(f"⚠️ 피드백 검색 중 예상치 못한 오류: {str(e)} → 메인 DB 검색으로 진행")
         return None
 
+def index_json_data_incremental(jira_tickets: list, file_path: str = None):
+    """특정 Jira 티켓들만 증분 색인 (추가/수정)"""
+    try:
+        if not file_path:
+            file_path = os.path.join(DOCS_DIR, "effort_estimations.json")
+        
+        if not os.path.exists(file_path):
+            logger.warning(f"⚠️ JSON 파일 없음: {file_path}")
+            return False
+        
+        # 벡터 DB 생성
+        embedding = OpenAIEmbeddings()
+        vectordb = Chroma(persist_directory=CHROMA_DIR, embedding_function=embedding)
+        
+        # JSON 파일 읽기
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # 대상 티켓만 필터링
+        target_items = [item for item in data if item.get('jira_ticket') in jira_tickets]
+        
+        if not target_items:
+            logger.info(f"📊 증분 색인: 대상 항목 없음")
+            return True
+        
+        logger.info(f"📊 증분 색인: {len(target_items)}개 항목 처리 중...")
+        
+        # 기존 데이터 제거 (해당 티켓만) - 최적화: where 필터 사용
+        try:
+            # Chroma where 필터로 특정 티켓만 조회 (전체 DB 순회 없음)
+            collection = vectordb.get(where={"jira_ticket": {"$in": jira_tickets}})
+            docs_to_remove_ids = collection.get("ids", [])
+            
+            if docs_to_remove_ids:
+                vectordb._collection.delete(docs_to_remove_ids)
+                logger.info(f"   🗑️ 기존 데이터 제거: {len(docs_to_remove_ids)}개")
+        except Exception as del_error:
+            logger.warning(f"⚠️ 기존 데이터 제거 중 오류 (무시하고 계속): {del_error}")
+        
+        # 새 데이터 색인
+        docs = []
+        for item in target_items:
+            # Epic 정보
+            epic_info = ""
+            if item.get('epic_key'):
+                epic_info = f"\nEpic: {item.get('epic_key', '')}"
+                if item.get('epic_name'):
+                    epic_info += f" ({item.get('epic_name', '')})"
+            
+            # Story Points 표시 (원본 정보 포함)
+            story_points_display = f"{item.get('story_points', '')} M/D"
+            if item.get('story_points_unit') == 'M/M':
+                story_points_display += f" (원본: {item.get('story_points_original', '')} M/M)"
+            
+            # 텍스트 생성
+            text_content = f"""
+Jira 티켓: {item.get('jira_ticket', '')}
+제목: {item.get('title', '')}{epic_info}
+Story Points: {story_points_display}
+담당자: {item.get('team_member', '')}
+산정 이유: {item.get('estimation_reason', '')}
+설명: {item.get('description', '')}
+댓글: {item.get('comments', '')}
+비고: {item.get('notes', '')}
+등록일: {item.get('created_date', '')}
+"""
+            
+            doc = Document(
+                page_content=text_content.strip(),
+                metadata={
+                    "source": "effort_estimations.json",
+                    "jira_ticket": item.get('jira_ticket', ''),
+                    "title": item.get('title', ''),
+                    "story_points": item.get('story_points', ''),
+                    "story_points_original": item.get('story_points_original', ''),
+                    "story_points_unit": item.get('story_points_unit', 'M/D'),
+                    "team_member": item.get('team_member', ''),
+                    "major_category": item.get('major_category', ''),
+                    "minor_category": item.get('minor_category', ''),
+                    "sub_category": item.get('sub_category', ''),
+                    "epic_key": item.get('epic_key', ''),
+                    "epic_name": item.get('epic_name', ''),
+                    "last_modified": datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat(),
+                    "file_size": os.path.getsize(file_path)
+                }
+            )
+            docs.append(doc)
+        
+        # 벡터 DB에 추가
+        if docs:
+            vectordb.add_documents(docs)
+            try:
+                vectordb.persist()
+            except Exception:
+                pass  # persist() 메서드가 없을 수 있음
+            logger.info(f"   ✅ 증분 색인 완료: {len(docs)}개 추가")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ 증분 색인 실패: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
 def index_json_data(file_path: str, force: bool = False):
-    """JSON 파일을 벡터 DB에 인덱싱"""
+    """JSON 파일을 벡터 DB에 인덱싱 (전체 재색인)"""
     try:
         # 직접 벡터 DB 생성 (get_vectordb() 호출하지 않음)
         embedding = OpenAIEmbeddings()
@@ -989,13 +1094,25 @@ def index_json_data(file_path: str, force: bool = False):
         docs = []
         for item in data:
             # JSON 데이터를 검색 가능한 텍스트로 변환
+            epic_info = ""
+            if item.get('epic_key'):
+                epic_info = f"\nEpic: {item.get('epic_key', '')}"
+                if item.get('epic_name'):
+                    epic_info += f" ({item.get('epic_name', '')})"
+            
+            # Story Points 표시 (원본 정보 포함)
+            story_points_display = f"{item.get('story_points', '')} M/D"
+            if item.get('story_points_unit') == 'M/M':
+                story_points_display += f" (원본: {item.get('story_points_original', '')} M/M)"
+            
             text_content = f"""
 Jira 티켓: {item.get('jira_ticket', '')}
-제목: {item.get('title', '')}
-Story Points: {item.get('story_points', '')}
+제목: {item.get('title', '')}{epic_info}
+Story Points: {story_points_display}
 담당자: {item.get('team_member', '')}
 산정 이유: {item.get('estimation_reason', '')}
 설명: {item.get('description', '')}
+댓글: {item.get('comments', '')}
 비고: {item.get('notes', '')}
 등록일: {item.get('created_date', '')}
 """
@@ -1007,10 +1124,14 @@ Story Points: {item.get('story_points', '')}
                     "jira_ticket": item.get('jira_ticket', ''),
                     "title": item.get('title', ''),
                     "story_points": item.get('story_points', ''),
+                    "story_points_original": item.get('story_points_original', ''),
+                    "story_points_unit": item.get('story_points_unit', 'M/D'),
                     "team_member": item.get('team_member', ''),
                     "major_category": item.get('major_category', ''),
                     "minor_category": item.get('minor_category', ''),
                     "sub_category": item.get('sub_category', ''),
+                    "epic_key": item.get('epic_key', ''),
+                    "epic_name": item.get('epic_name', ''),
                     "last_modified": datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat(),
                     "file_size": os.path.getsize(file_path)
                 }

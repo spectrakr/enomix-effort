@@ -6,6 +6,7 @@ Jira 연동 및 수동 데이터 입력을 통한 공수 산정 이력 관리
 import os
 import json
 import logging
+import shutil
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from dataclasses import dataclass, asdict
@@ -150,7 +151,7 @@ class EffortEstimation:
     """공수 산정 데이터 모델 (Story Point 기반)"""
     jira_ticket: str  # Jira 티켓 (ENOMIX-XXX)
     title: str  # 제목
-    story_points: float  # Story Point
+    story_points: float  # Story Point (M/D 단위로 통일)
     estimation_reason: Optional[str] = None
     tech_stack: Optional[List[str]] = None
     team_member: Optional[str] = None
@@ -161,6 +162,14 @@ class EffortEstimation:
     major_category: Optional[str] = None  # 대분류
     minor_category: Optional[str] = None  # 중분류
     sub_category: Optional[str] = None    # 소분류
+    # Epic 필드 추가
+    epic_key: Optional[str] = None  # Epic 티켓 (ENOMIX-XXX)
+    epic_name: Optional[str] = None  # Epic 제목
+    # 댓글 필드 추가
+    comments: Optional[str] = None  # Jira 댓글들 (텍스트로 병합)
+    # 공수 원본 정보 (WORK 프로젝트용)
+    story_points_original: Optional[float] = None  # 원본 값 (예: 0.5 M/M)
+    story_points_unit: Optional[str] = None  # 원본 단위 (M/M 또는 M/D)
     
     def __post_init__(self):
         if self.created_date is None:
@@ -221,6 +230,34 @@ class EffortEstimationManager:
             logger.error(f"❌ 공수 산정 데이터 로드 실패: {str(e)}")
             self.estimations = []
     
+    def backup_data(self):
+        """데이터 파일 백업 (최신 1개만 유지)"""
+        try:
+            if not os.path.exists(self.data_file):
+                logger.info("ℹ️ 백업할 데이터 파일이 없습니다")
+                return True
+            
+            backup_file = os.path.join(DOCS_DIR, "effort_estimations_backup.json")
+            
+            # 기존 백업 파일이 있으면 타임스탬프 확인
+            if os.path.exists(backup_file):
+                backup_time = datetime.fromtimestamp(os.path.getmtime(backup_file))
+                logger.info(f"🔄 이전 백업 파일 교체 (생성일: {backup_time.strftime('%Y-%m-%d %H:%M:%S')})")
+            
+            # 현재 파일을 백업
+            shutil.copy2(self.data_file, backup_file)
+            
+            # 파일 크기 확인
+            file_size = os.path.getsize(backup_file)
+            file_size_kb = file_size / 1024
+            
+            logger.info(f"✅ 데이터 백업 완료: {backup_file} ({file_size_kb:.1f}KB, {len(self.estimations)}개 항목)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ 데이터 백업 실패: {str(e)}")
+            return False
+    
     def save_data(self):
         """공수 산정 데이터 저장"""
         try:
@@ -247,8 +284,17 @@ class EffortEstimationManager:
                         break
                 
                 if existing_index is not None:
-                    # 기존 데이터 업데이트
+                    # 기존 데이터 업데이트 (카테고리 정보 보존)
                     logger.info(f"🔄 기존 데이터 업데이트: {estimation.jira_ticket}")
+                    existing_data = self.estimations[existing_index]
+                    
+                    # 카테고리가 기존에 있으면 보존, 없으면 새 값 사용
+                    if existing_data.major_category:
+                        estimation.major_category = existing_data.major_category
+                        estimation.minor_category = existing_data.minor_category
+                        estimation.sub_category = existing_data.sub_category
+                        logger.info(f"   📂 카테고리 보존: {existing_data.major_category}/{existing_data.minor_category}/{existing_data.sub_category}")
+                    
                     self.estimations[existing_index] = estimation
                 else:
                     # 새 데이터 추가
@@ -286,7 +332,20 @@ class EffortEstimationManager:
             # 기본 정보
             info = f"Jira 티켓: {est.jira_ticket}\n"
             info += f"제목: {est.title}\n"
-            info += f"Story Points: {est.story_points}\n"
+            info += f"Story Points: {est.story_points} M/D"
+            
+            # 원본 공수 정보 추가 (WORK 프로젝트용)
+            if est.story_points_original and est.story_points_unit:
+                if est.story_points_unit == 'M/M':
+                    info += f" (원본: {est.story_points_original} M/M)"
+            info += "\n"
+            
+            # Epic 정보 추가
+            if est.epic_key:
+                info += f"Epic: {est.epic_key}"
+                if est.epic_name:
+                    info += f" ({est.epic_name})"
+                info += "\n"
             
             if est.estimation_reason:
                 info += f"산정 이유: {est.estimation_reason}\n"
@@ -299,6 +358,9 @@ class EffortEstimationManager:
             
             if est.description:
                 info += f"설명: {est.description}\n"
+            
+            if est.comments:
+                info += f"댓글: {est.comments}\n"
             
             if est.notes:
                 info += f"비고: {est.notes}\n"
@@ -329,6 +391,26 @@ class EffortEstimationManager:
             return False
         except Exception as e:
             logger.error(f"❌ 카테고리 수정 실패: {str(e)}")
+            return False
+
+    def update_estimation_epic(self, jira_ticket: str, epic_key: str, epic_name: str) -> bool:
+        """공수 산정 데이터의 Epic 정보 수정"""
+        try:
+            for i, estimation in enumerate(self.estimations):
+                if estimation.jira_ticket == jira_ticket:
+                    # Epic 필드 업데이트
+                    self.estimations[i].epic_key = epic_key
+                    self.estimations[i].epic_name = epic_name
+                    
+                    # 데이터 저장
+                    self.save_data()
+                    logger.info(f"✅ Epic 정보 수정 완료: {jira_ticket} -> {epic_key} ({epic_name})")
+                    return True
+            
+            logger.warning(f"⚠️ 해당 티켓을 찾을 수 없음: {jira_ticket}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Epic 정보 수정 실패: {str(e)}")
             return False
 
     def get_estimation_by_ticket(self, jira_ticket: str) -> Optional[EffortEstimation]:

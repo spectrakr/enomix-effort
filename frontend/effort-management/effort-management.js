@@ -57,6 +57,8 @@ function switchTab(tabName) {
       loadMajorCategories();
     } else if (tabName === 'sync') {
       loadSyncMajorCategories();
+    } else if (tabName === 'scheduler') {
+      loadSchedulerHistory();
     }
   }, 10);
 }
@@ -1033,6 +1035,114 @@ function closeCategoryEditModal() {
   document.getElementById('categoryEditModal').style.display = 'none';
 }
 
+// 완료된 Epic 자동 동기화
+let syncPollingInterval = null;
+
+async function autoSyncCompletedEpics() {
+  const statusDiv = document.getElementById('autoSyncStatus');
+  
+  try {
+    // 동기화 시작 (ENOMIX 프로젝트만)
+    const response = await fetch('/effort/auto-sync-completed-epics/', {
+      method: 'POST'
+    });
+    
+    const result = await response.json();
+    
+    if (result.success && result.is_running) {
+      // 백그라운드 작업 시작됨
+      statusDiv.style.display = 'block';
+      statusDiv.innerHTML = `🔄 완료된 Epic 검색 중 (ENOMIX 프로젝트)...`;
+      
+      // 폴링 시작 (3초마다 상태 확인)
+      startSyncPolling();
+    } else {
+      alert(result.message || '동기화를 시작할 수 없습니다');
+    }
+  } catch (error) {
+    console.error('자동 동기화 오류:', error);
+    alert('❌ 자동 동기화 중 오류가 발생했습니다');
+  }
+}
+
+// (프로젝트 선택 기능 제거됨 - ENOMIX만 자동 동기화 지원)
+
+async function startSyncPolling() {
+  const statusDiv = document.getElementById('autoSyncStatus');
+  
+  // 기존 폴링 중지
+  if (syncPollingInterval) {
+    clearInterval(syncPollingInterval);
+  }
+  
+  // 3초마다 상태 확인
+  syncPollingInterval = setInterval(async () => {
+    try {
+      const response = await fetch('/effort/sync-status/');
+      const status = await response.json();
+      
+      if (status.is_running) {
+        // 진행 중
+        const progressBar = `<div style="background: #e0e0e0; border-radius: 10px; height: 20px; margin: 10px 0;">
+          <div style="background: #4caf50; width: ${status.progress}%; height: 100%; border-radius: 10px; transition: width 0.3s;"></div>
+        </div>`;
+        
+        statusDiv.innerHTML = `
+          🔄 ${status.message}<br>
+          ${progressBar}
+          진행률: ${status.progress}%<br>
+          완료: ${status.completed_epics}/${status.total_epics} Epic<br>
+          ${status.current_epic ? `현재: ${status.current_epic}` : ''}
+        `;
+      } else {
+        // 완료됨
+        clearInterval(syncPollingInterval);
+        syncPollingInterval = null;
+        
+        statusDiv.style.display = 'none';
+        
+        const message = `✅ 완료된 Epic 자동 동기화 완료!\n\n` +
+                       `총 Epic 수: ${status.total_epics}개\n` +
+                       `성공: ${status.completed_epics}개\n` +
+                       `실패: ${status.failed_epics}개\n\n` +
+                       (status.failed_list && status.failed_list.length > 0 
+                         ? `실패 목록:\n${status.failed_list.join('\n')}\n\n` 
+                         : '') +
+                       `💡 동기화된 데이터를 검색에 반영하려면\n` +
+                       `   '데이터 재색인' 버튼을 클릭하세요.`;
+        
+        alert(message);
+        
+        // 데이터 목록 새로고침
+        if (status.completed_epics > 0) {
+          loadEffortList();
+        }
+      }
+    } catch (error) {
+      console.error('상태 조회 오류:', error);
+    }
+  }, 3000);  // 3초마다
+}
+
+// 페이지 로드 시 진행 중인 동기화 확인
+async function checkOngoingSync() {
+  try {
+    const response = await fetch('/effort/sync-status/');
+    const status = await response.json();
+    
+    if (status.is_running) {
+      // 진행 중인 동기화 발견
+      const statusDiv = document.getElementById('autoSyncStatus');
+      if (statusDiv) {
+        statusDiv.style.display = 'block';
+        startSyncPolling();
+      }
+    }
+  } catch (error) {
+    console.error('동기화 상태 확인 오류:', error);
+  }
+}
+
 // Epic 하위 작업 동기화
 async function syncEpicData() {
   const epicKey = document.getElementById("epicKey").value.trim();
@@ -1058,7 +1168,9 @@ async function syncEpicData() {
         `• 총 작업 수: ${result.total_tasks}\n` +
         `• 추가된 작업: ${result.added_tasks}\n` +
         `• 업데이트된 작업: ${result.updated_tasks}\n` +
-        `• 건너뛴 작업: ${result.skipped_tasks}`;
+        `• 건너뛴 작업: ${result.skipped_tasks}\n\n` +
+        `💡 동기화된 데이터를 검색에 반영하려면\n` +
+        `   '데이터 재색인' 버튼을 클릭하세요.`;
       
       alert(message);
       loadEffortList(); // 목록 새로고침
@@ -1174,9 +1286,139 @@ async function deleteEffortData(jiraTicket, title) {
 }
 
 // 페이지 로드 시 초기화
+// 스케줄러 이력 로드
+async function loadSchedulerHistory() {
+  const contentDiv = document.getElementById('schedulerHistoryContent');
+  
+  try {
+    contentDiv.innerHTML = '<div class="loading">📋 스케줄러 이력을 로드 중입니다...</div>';
+    
+    const response = await fetch('/effort/scheduler-history/');
+    const result = await response.json();
+    
+    if (!result.success || !result.history || result.history.length === 0) {
+      contentDiv.innerHTML = '<p style="text-align: center; color: #666;">스케줄러 실행 이력이 없습니다.</p>';
+      return;
+    }
+    
+    // 테이블 생성
+    let html = `
+      <div style="overflow-x: auto;">
+        <table style="width: 100%; border-collapse: collapse; background: white; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <thead>
+            <tr style="background: #f5f5f5; border-bottom: 2px solid #ddd;">
+              <th style="padding: 12px; text-align: left; font-weight: 600;">시작 시간</th>
+              <th style="padding: 12px; text-align: left; font-weight: 600;">완료 시간</th>
+              <th style="padding: 12px; text-align: left; font-weight: 600;">스케줄러명</th>
+              <th style="padding: 12px; text-align: center; font-weight: 600;">상태</th>
+              <th style="padding: 12px; text-align: center; font-weight: 600;">성공</th>
+              <th style="padding: 12px; text-align: center; font-weight: 600;">실패</th>
+              <th style="padding: 12px; text-align: left; font-weight: 600;">상세 정보</th>
+            </tr>
+          </thead>
+          <tbody>
+    `;
+    
+    result.history.forEach((item, index) => {
+      // 간단한 날짜 포맷: 2025-12-23 14:28:55
+      const formatDateTime = (dateStr) => {
+        if (!dateStr) return '-';
+        const date = new Date(dateStr);
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        const hours = String(date.getHours()).padStart(2, '0');
+        const minutes = String(date.getMinutes()).padStart(2, '0');
+        const seconds = String(date.getSeconds()).padStart(2, '0');
+        return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+      };
+      
+      const startTime = formatDateTime(item.start_time);
+      const endTime = formatDateTime(item.end_time);
+      const statusBadge = getStatusBadge(item.status);
+      const details = item.details || {};
+      
+      // 배경색 (짝수/홀수)
+      const bgColor = index % 2 === 0 ? '#fff' : '#f9f9f9';
+      
+      html += `
+        <tr style="background: ${bgColor}; border-bottom: 1px solid #eee;">
+          <td style="padding: 12px;">${startTime}</td>
+          <td style="padding: 12px;">${endTime}</td>
+          <td style="padding: 12px;"><strong>${item.scheduler_name}</strong></td>
+          <td style="padding: 12px; text-align: center;">${statusBadge}</td>
+          <td style="padding: 12px; text-align: center;">${details.completed_epics || '-'}</td>
+          <td style="padding: 12px; text-align: center;">${details.failed_epics || '-'}</td>
+          <td style="padding: 12px;">
+            ${formatSchedulerDetails(item.status, details)}
+          </td>
+        </tr>
+      `;
+    });
+    
+    html += `
+          </tbody>
+        </table>
+      </div>
+      <p style="margin-top: 20px; color: #666; font-size: 14px;">
+        총 ${result.total}개의 실행 이력 (최근 100개)
+      </p>
+    `;
+    
+    contentDiv.innerHTML = html;
+    
+  } catch (error) {
+    console.error('스케줄러 이력 로드 오류:', error);
+    contentDiv.innerHTML = '<p style="color: red;">❌ 스케줄러 이력을 불러오는 중 오류가 발생했습니다.</p>';
+  }
+}
+
+function getStatusBadge(status) {
+  const badges = {
+    'success': '<span style="background: #4caf50; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600;">✅ 성공</span>',
+    'failed': '<span style="background: #f44336; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600;">❌ 실패</span>'
+  };
+  return badges[status] || '<span style="background: #999; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px;">알 수 없음</span>';
+}
+
+function formatSchedulerDetails(status, details) {
+  if (status === 'success') {
+    let html = `
+      <div style="font-size: 14px;">
+        <div>총 Epic: ${details.total_epics || 0}개</div>
+        <div>소요 시간: ${Math.round(details.duration_seconds || 0)}초</div>
+    `;
+    
+    if (details.failed_list && details.failed_list.length > 0) {
+      html += `
+        <details style="margin-top: 8px;">
+          <summary style="cursor: pointer; color: #f44336; font-weight: 600;">실패 목록 (${details.failed_list.length}개)</summary>
+          <ul style="margin: 8px 0; padding-left: 20px; font-size: 13px;">
+            ${details.failed_list.map(item => `<li>${item}</li>`).join('')}
+          </ul>
+        </details>
+      `;
+    }
+    
+    html += '</div>';
+    return html;
+  } else if (status === 'failed') {
+    return `
+      <div style="font-size: 14px; color: #f44336;">
+        <div><strong>오류:</strong> ${details.error || '알 수 없는 오류'}</div>
+        ${details.duration_seconds ? `<div>소요 시간: ${Math.round(details.duration_seconds)}초</div>` : ''}
+      </div>
+    `;
+  } else if (status === 'running') {
+    return `<div style="font-size: 14px; color: #2196f3;">${details.message || '실행 중...'}</div>`;
+  }
+  return '-';
+}
+
 window.onload = function() {
   loadStatistics();
   loadMajorCategories();
+  checkOngoingSync();  // 진행 중인 동기화 확인
   
   // 카테고리 수정 폼 이벤트 리스너
   document.getElementById('categoryEditForm').addEventListener('submit', handleCategoryEdit);

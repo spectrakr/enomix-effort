@@ -59,6 +59,10 @@ data/docs/negative_feedback.json
 data/docs/slack_qa_mapping.json
 data/docs/web_qa_mapping.json
 
+# 백업 파일 (자동 생성)
+data/docs/*_backup.json
+data/docs/*.bak
+
 # 단, 초기 데이터는 포함 (공유 필요)
 !data/docs/categories.json
 !data/docs/effort_estimations.json
