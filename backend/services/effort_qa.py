@@ -26,10 +26,11 @@ JIRA_BASE_URL = "https://enomix.atlassian.net/browse"
 # 고객사 가중치 데이터 로드
 CUSTOMER_WEIGHTS_FILE = os.path.join(DOCS_DIR, "customer_weights.json")
 _customer_weights_cache = None
+_difficulty_range_cache = None  # 난이도 범위 캐시 (min, max)
 
 def load_customer_weights() -> Dict[str, Any]:
     """고객사 가중치 데이터 로드 (캐싱)"""
-    global _customer_weights_cache
+    global _customer_weights_cache, _difficulty_range_cache
     
     if _customer_weights_cache is not None:
         return _customer_weights_cache
@@ -39,6 +40,21 @@ def load_customer_weights() -> Dict[str, Any]:
             with open(CUSTOMER_WEIGHTS_FILE, 'r', encoding='utf-8') as f:
                 _customer_weights_cache = json.load(f)
                 logger.info(f"✅ 고객사 가중치 데이터 로드 완료: {len(_customer_weights_cache)}개")
+                
+                # 난이도 범위 계산 (캐싱)
+                difficulties = []
+                for customer_data in _customer_weights_cache.values():
+                    difficulty = customer_data.get('난이도분류', '')
+                    if difficulty and str(difficulty).strip() and str(difficulty).strip() != '-':
+                        try:
+                            difficulties.append(int(str(difficulty).strip()))
+                        except (ValueError, TypeError):
+                            pass
+                
+                if difficulties:
+                    _difficulty_range_cache = (min(difficulties), max(difficulties))
+                    logger.info(f"📊 난이도 범위: {_difficulty_range_cache[0]} ~ {_difficulty_range_cache[1]}")
+                
                 return _customer_weights_cache
         else:
             logger.warning(f"⚠️ 고객사 가중치 파일 없음: {CUSTOMER_WEIGHTS_FILE}")
@@ -445,10 +461,17 @@ def run_effort_qa_chain(question: str) -> dict:
                                     answer_parts.append("🏢 고객사 특성 분석:")
                                     answer_parts.append(f"   • 고객사: {customer_name}")
                                     
-                                    # 난이도 분류 표시
+                                    # 난이도 분류 표시 (범위 포함)
                                     difficulty = customer_data.get('난이도분류', 'N/A')
                                     if difficulty and str(difficulty).strip():
-                                        answer_parts.append(f"   • 난이도 등급: {difficulty}")
+                                        difficulty_str = str(difficulty).strip()
+                                        # 전역 범위 캐시 사용
+                                        global _difficulty_range_cache
+                                        if _difficulty_range_cache:
+                                            min_diff, max_diff = _difficulty_range_cache
+                                            answer_parts.append(f"   • 난이도 등급: {difficulty_str} (범위: {min_diff}~{max_diff}, 낮을수록 협조적)")
+                                        else:
+                                            answer_parts.append(f"   • 난이도 등급: {difficulty_str}")
                                     
                                     # 주요 가중치 지수 표시 (1~5 스케일)
                                     answer_parts.append(f"   • 요구사항 명확성: {weights.get('요구사항명확성', 3.0):.2f}/5.0 (낮을수록 명확)")
@@ -463,7 +486,8 @@ def run_effort_qa_chain(question: str) -> dict:
                                             answer_parts.append(f"      - {risk}")
                                         
                                         # 간단한 조언만 제공
-                                        answer_parts.append(f"\n   💡 해당 고객사는 요구사항 변경이나 소통 이슈가 있을 수 있어 일정 산정 시 여유를 두는 것을 권장합니다.\n")
+                                        answer_parts.append(f"\n   💡 해당 고객사는 요구사항 변경이나 소통 이슈가 있을 수 있어 일정 산정 시 여유를 두는 것을 권장합니다.")
+                                        answer_parts.append(f"   📊 참고자료: https://docs.google.com/spreadsheets/d/15cUyf1xB9R4gYu9Ot8r_J99RLh5JB0hw/edit?gid=1505444697#gid=1505444697\n")
                                         
                                         # 수치는 참고용으로 주석 처리
                                         # buffer_percent = risk_analysis['buffer_percent']
@@ -473,7 +497,8 @@ def run_effort_qa_chain(question: str) -> dict:
                                         # answer_parts.append(f"   💡 권장 총 공수: {recommended_total}일 (버퍼 포함)\n")
                                     else:
                                         # 리스크가 없는 협조적인 고객사
-                                        answer_parts.append(f"\n   ✅ 협조적인 고객사로 표준 공수로 충분합니다.\n")
+                                        answer_parts.append(f"\n   ✅ 협조적인 고객사로 표준 공수로 충분합니다.")
+                                        answer_parts.append(f"   📊 참고자료: https://docs.google.com/spreadsheets/d/15cUyf1xB9R4gYu9Ot8r_J99RLh5JB0hw/edit?gid=1505444697#gid=1505444697\n")
                                 else:
                                     logger.info(f"ℹ️ 고객사 '{customer_name}' 정보 없음")
                             else:

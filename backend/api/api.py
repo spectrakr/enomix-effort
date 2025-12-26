@@ -43,7 +43,6 @@ import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from data.prompts import intent_prompt_manager
-# from apscheduler.schedulers.background import BackgroundScheduler  # SSL 문제로 임시 비활성화
 
 # Configure logging
 from ..utils.config import LOG_DIR
@@ -82,6 +81,7 @@ sync_status = {
     "total_epics": 0,
     "completed_epics": 0,
     "failed_epics": 0,
+    "skipped_epics": 0,  # 스킵된 Epic 수
     "current_epic": "",
     "message": "",
     "failed_list": []
@@ -89,9 +89,6 @@ sync_status = {
 
 # Create FastAPI app
 app = FastAPI()
-
-# 스케줄러 초기화 (SSL 문제로 임시 비활성화)
-# scheduler = BackgroundScheduler()
 
 # 기존 관리자 페이지 제거됨
 
@@ -144,19 +141,10 @@ async def startup_event():
         await auto_migrate_categories()
         logger.info("   ✅ 카테고리 마이그레이션 완료")
         
-        # Epic 자동 동기화 스케줄러 시작 (SSL 문제로 임시 비활성화)
+        # Epic 자동 동기화 스케줄러 설정
         logger.info("⏰ [3/3] 스케줄러 설정 중...")
-        # scheduler.add_job(
-        #     sync_completed_epics_background,
-        #     'cron',
-        #     hour=3,
-        #     minute=0,
-        #     id='auto_sync_completed_epics',
-        #     replace_existing=True
-        # )
-        # scheduler.start()
-        logger.info("   ⚠️ Epic 자동 동기화 스케줄러 비활성화 (SSL 문제)")
-        logger.info("   ℹ️ 수동 실행만 가능합니다")
+        logger.info("   ✅ Epic 자동 동기화: Linux cron 사용 (매일 새벽 3시)")
+        logger.info("   ℹ️ 수동 실행도 가능합니다")
         
         logger.info("=" * 80)
         logger.info("✅ 서버 기동 완료! 🎉")
@@ -169,9 +157,8 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """서버 종료 시 스케줄러 정리"""
+    """서버 종료"""
     try:
-        # scheduler.shutdown()  # SSL 문제로 임시 비활성화
         logger.info("✅ 서버 종료 완료")
     except Exception as e:
         logger.error(f"❌ 서버 종료 오류: {str(e)}")
@@ -1564,6 +1551,7 @@ def sync_completed_epics_background():
         sync_status["progress"] = 0
         sync_status["completed_epics"] = 0
         sync_status["failed_epics"] = 0
+        sync_status["skipped_epics"] = 0
         sync_status["current_epic"] = ""
         sync_status["message"] = f"Jira에서 완료된 Epic 검색 중 (ENOMIX 프로젝트)..."
         sync_status["failed_list"] = []
@@ -1593,10 +1581,25 @@ def sync_completed_epics_background():
         logger.info(f"🔍 완료된 Epic {len(completed_epics)}개 발견")
         
         # 2. 각 Epic 동기화
+        skipped_epics = 0
         for idx, epic in enumerate(completed_epics, 1):
             epic_key = epic['key']
             
             try:
+                # Epic 스킵 로직: 이미 동기화된 Epic은 건너뛰기
+                from ..services.effort_estimation import effort_manager
+                already_synced = any(
+                    est.epic_key == epic_key 
+                    for est in effort_manager.estimations
+                )
+                
+                if already_synced:
+                    logger.info(f"⏭️ Epic 스킵 (이미 동기화됨): {epic_key} - {epic['summary'][:50]}...")
+                    skipped_epics += 1
+                    sync_status["skipped_epics"] = skipped_epics  # 전역 상태에 저장
+                    sync_status["completed_epics"] += 1  # 스킵도 완료로 카운트
+                    continue
+                
                 sync_status["current_epic"] = f"{epic_key} - {epic['summary'][:30]}..."
                 sync_status["message"] = f"동기화 중: {epic_key} ({idx}/{len(completed_epics)})"
                 logger.info(f"🔄 Epic 동기화 중: {epic_key} - {epic['summary'][:50]}...")
@@ -1693,8 +1696,19 @@ def sync_completed_epics_background():
         sync_status["is_running"] = False
         sync_status["progress"] = 100
         sync_status["current_epic"] = ""
-        sync_status["message"] = f"동기화 완료: {sync_status['completed_epics']}개 성공, {sync_status['failed_epics']}개 실패 (색인은 별도 실행 필요)"
+        
+        # 결과 메시지 생성
+        result_parts = [f"{sync_status['completed_epics']}개 처리"]
+        if skipped_epics > 0:
+            result_parts.append(f"{skipped_epics}개 스킵(이미 동기화됨)")
+        if sync_status['failed_epics'] > 0:
+            result_parts.append(f"{sync_status['failed_epics']}개 실패")
+        result_parts.append("(색인은 별도 실행 필요)")
+        
+        sync_status["message"] = f"동기화 완료: {', '.join(result_parts)}"
         logger.info(f"✅ 완료된 Epic 자동 동기화 완료: {sync_status['message']}")
+        if skipped_epics > 0:
+            logger.info(f"⏭️ 이미 동기화된 Epic {skipped_epics}개 스킵")
         logger.info(f"💡 벡터 DB 색인은 '데이터 재색인' 버튼으로 별도 실행하세요")
         
         # 성공 이력 저장
@@ -2727,6 +2741,23 @@ def reindex_json_background(json_file_path: str):
         logger.error(f"❌ 백그라운드 재인덱싱 오류: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
+
+# 가이드 마크다운 파일 서빙
+@app.get("/사용자_가이드.md")
+async def serve_user_guide():
+    """사용자 가이드 마크다운 파일 제공"""
+    file_path = os.path.join(DOCS_DIR, "사용자_가이드.md")
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="text/markdown; charset=utf-8")
+    return JSONResponse(status_code=404, content={"error": "사용자 가이드를 찾을 수 없습니다"})
+
+@app.get("/슬랙봇_사용_가이드.md")
+async def serve_slack_guide():
+    """슬랙봇 사용 가이드 마크다운 파일 제공"""
+    file_path = os.path.join(DOCS_DIR, "슬랙봇_사용_가이드.md")
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="text/markdown; charset=utf-8")
+    return JSONResponse(status_code=404, content={"error": "슬랙봇 사용 가이드를 찾을 수 없습니다"})
 
 # StaticFiles 마운트 - API 라우트들 뒤에 배치
 app.mount("/effort-management", StaticFiles(directory=os.path.join(STATIC_DIR, "effort-management")), name="effort-management")

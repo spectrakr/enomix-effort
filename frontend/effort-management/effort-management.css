@@ -1233,3 +1233,179 @@ h2::after {
   border-radius: 8px;
   margin-top: 20px;
 }
+
+/* 가이드 탭 스타일 */
+.guide-tabs {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 20px;
+  border-bottom: 2px solid var(--border-color);
+}
+
+.guide-tab-btn {
+  padding: 12px 24px;
+  background: transparent;
+  border: none;
+  border-bottom: 3px solid transparent;
+  color: var(--text-color);
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  position: relative;
+  bottom: -2px;
+}
+
+.guide-tab-btn:hover {
+  color: var(--primary-color);
+  background: rgba(101, 85, 143, 0.05);
+}
+
+.guide-tab-btn.active {
+  color: var(--primary-color);
+  border-bottom-color: var(--primary-color);
+  background: rgba(101, 85, 143, 0.05);
+}
+
+.guide-content {
+  display: none;
+  animation: fadeIn 0.3s ease;
+}
+
+.guide-content.active {
+  display: block;
+}
+
+.guide-markdown {
+  background: white;
+  padding: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  box-shadow: var(--shadow);
+  line-height: 1.8;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.guide-markdown h1 {
+  color: var(--primary-color);
+  font-size: 2em;
+  margin-bottom: 20px;
+  padding-bottom: 10px;
+  border-bottom: 2px solid var(--border-color);
+}
+
+.guide-markdown h2 {
+  color: var(--primary-color);
+  font-size: 1.5em;
+  margin-top: 30px;
+  margin-bottom: 15px;
+  padding-left: 0;
+}
+
+.guide-markdown h2::after {
+  display: none;
+}
+
+.guide-markdown h3 {
+  color: var(--secondary-color);
+  font-size: 1.2em;
+  margin-top: 20px;
+  margin-bottom: 10px;
+}
+
+.guide-markdown h4 {
+  color: var(--text-color);
+  font-size: 1.1em;
+  margin-top: 15px;
+  margin-bottom: 10px;
+}
+
+.guide-markdown p {
+  margin-bottom: 15px;
+  color: var(--text-color);
+}
+
+.guide-markdown ul,
+.guide-markdown ol {
+  margin-left: 25px;
+  margin-bottom: 15px;
+}
+
+.guide-markdown li {
+  margin-bottom: 8px;
+}
+
+.guide-markdown code {
+  background: #f5f5f5;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: 'Courier New', monospace;
+  font-size: 0.9em;
+  color: #d63384;
+}
+
+.guide-markdown pre {
+  background: #f8f9fa;
+  padding: 15px;
+  border-radius: 8px;
+  border-left: 4px solid var(--primary-color);
+  overflow-x: auto;
+  margin-bottom: 15px;
+}
+
+.guide-markdown pre code {
+  background: none;
+  padding: 0;
+  color: var(--text-color);
+  display: block;
+}
+
+.guide-markdown a {
+  color: var(--info-color);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: all 0.3s ease;
+}
+
+.guide-markdown a:hover {
+  border-bottom-color: var(--info-color);
+  color: #1976d2;
+}
+
+.guide-markdown blockquote {
+  border-left: 4px solid var(--warning-color);
+  background: #fff9e6;
+  padding: 15px 20px;
+  margin: 20px 0;
+  border-radius: 4px;
+}
+
+.guide-markdown hr {
+  border: none;
+  border-top: 2px solid var(--border-color);
+  margin: 30px 0;
+}
+
+.guide-markdown strong {
+  color: var(--primary-color);
+  font-weight: 600;
+}
+
+.guide-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 20px 0;
+}
+
+.guide-markdown table th,
+.guide-markdown table td {
+  border: 1px solid var(--border-color);
+  padding: 12px;
+  text-align: left;
+}
+
+.guide-markdown table th {
+  background: var(--light-bg);
+  font-weight: 600;
+}

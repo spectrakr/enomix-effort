@@ -59,6 +59,8 @@ function switchTab(tabName) {
       loadSyncMajorCategories();
     } else if (tabName === 'scheduler') {
       loadSchedulerHistory();
+    } else if (tabName === 'guide') {
+      loadGuideMarkdown();
     }
   }, 10);
 }
@@ -1092,6 +1094,7 @@ async function startSyncPolling() {
           ${progressBar}
           진행률: ${status.progress}%<br>
           완료: ${status.completed_epics}/${status.total_epics} Epic<br>
+          ${status.skipped_epics > 0 ? `⏭️ 스킵: ${status.skipped_epics}개 (이미 동기화됨)<br>` : ''}
           ${status.current_epic ? `현재: ${status.current_epic}` : ''}
         `;
       } else {
@@ -1104,6 +1107,7 @@ async function startSyncPolling() {
         const message = `✅ 완료된 Epic 자동 동기화 완료!\n\n` +
                        `총 Epic 수: ${status.total_epics}개\n` +
                        `성공: ${status.completed_epics}개\n` +
+                       (status.skipped_epics > 0 ? `⏭️ 스킵: ${status.skipped_epics}개 (이미 동기화됨)\n` : '') +
                        `실패: ${status.failed_epics}개\n\n` +
                        (status.failed_list && status.failed_list.length > 0 
                          ? `실패 목록:\n${status.failed_list.join('\n')}\n\n` 
@@ -1548,5 +1552,103 @@ function clearTitleSearch() {
 function handleSearchKeyPress(event) {
   if (event.key === 'Enter') {
     searchByTitle();
+  }
+}
+
+// ========== 사용 가이드 관련 함수 ==========
+
+// 가이드 탭 전환
+function switchGuideTab(tabName, event) {
+  // 모든 가이드 탭 버튼과 콘텐츠에서 active 제거
+  document.querySelectorAll('.guide-tab-btn').forEach(btn => {
+    btn.classList.remove('active');
+  });
+  document.querySelectorAll('.guide-content').forEach(content => {
+    content.classList.remove('active');
+  });
+  
+  // 선택된 탭 버튼 활성화
+  if (event && event.target) {
+    event.target.classList.add('active');
+  }
+  
+  // 선택된 탭 콘텐츠 활성화
+  if (tabName === 'web') {
+    document.getElementById('webGuide').classList.add('active');
+  } else if (tabName === 'slack') {
+    document.getElementById('slackGuide').classList.add('active');
+  }
+}
+
+// Markdown을 HTML로 변환 (간단한 변환)
+function convertMarkdownToHtml(markdown) {
+  if (!markdown) return '';
+  
+  let html = markdown;
+  
+  // 코드 블록 (```)
+  html = html.replace(/```([a-z]*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+  
+  // 인라인 코드 (`)
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  
+  // 제목 (##)
+  html = html.replace(/^######\s+(.+)$/gm, '<h6>$1</h6>');
+  html = html.replace(/^#####\s+(.+)$/gm, '<h5>$1</h5>');
+  html = html.replace(/^####\s+(.+)$/gm, '<h4>$1</h4>');
+  html = html.replace(/^###\s+(.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^##\s+(.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^#\s+(.+)$/gm, '<h1>$1</h1>');
+  
+  // 굵은 글씨 (**)
+  html = html.replace(/\*\*([^\*]+)\*\*/g, '<strong>$1</strong>');
+  
+  // 기울임 (*)
+  html = html.replace(/\*([^\*]+)\*/g, '<em>$1</em>');
+  
+  // 링크 [text](url)
+  html = html.replace(/\[([^\]]+)\]\(([^\)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+  
+  // 리스트 (-)
+  html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
+  
+  // 구분선 (---)
+  html = html.replace(/^---$/gm, '<hr>');
+  
+  // 줄바꿈
+  html = html.replace(/\n\n/g, '</p><p>');
+  html = html.replace(/\n/g, '<br>');
+  
+  // 전체를 p 태그로 감싸기
+  html = '<p>' + html + '</p>';
+  
+  // 빈 p 태그 제거
+  html = html.replace(/<p><\/p>/g, '');
+  html = html.replace(/<p>\s*<\/p>/g, '');
+  
+  return html;
+}
+
+// 가이드 마크다운 로드
+async function loadGuideMarkdown() {
+  try {
+    // 웹 사용자 가이드 로드
+    const webResponse = await fetch('/사용자_가이드.md');
+    const webMarkdown = await webResponse.text();
+    const webHtml = convertMarkdownToHtml(webMarkdown);
+    document.getElementById('webGuideContent').innerHTML = webHtml;
+    
+    // 슬랙봇 가이드 로드
+    const slackResponse = await fetch('/슬랙봇_사용_가이드.md');
+    const slackMarkdown = await slackResponse.text();
+    const slackHtml = convertMarkdownToHtml(slackMarkdown);
+    document.getElementById('slackGuideContent').innerHTML = slackHtml;
+    
+    console.log('✅ 가이드 마크다운 로드 완료');
+  } catch (error) {
+    console.error('❌ 가이드 마크다운 로드 실패:', error);
+    document.getElementById('webGuideContent').innerHTML = '<p style="color: red;">가이드를 불러오는 데 실패했습니다.</p>';
+    document.getElementById('slackGuideContent').innerHTML = '<p style="color: red;">가이드를 불러오는 데 실패했습니다.</p>';
   }
 }
